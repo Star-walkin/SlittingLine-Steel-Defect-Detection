@@ -1,0 +1,12 @@
+{
+  "camera": "CAM4",
+  "data_dir": "image_all\\image_data_patchcore_0228\\CAM4",
+  "num_images": 630,
+  "memory_bank_size": 64512,
+  "embedding_dim": 384,
+  "img_size": 256,
+  "coreset_ratio": 0.1,
+  "threshold_percentile": 99.5,
+  "score_threshold": 0.006176323629915714,
+  "epoch": 30
+}

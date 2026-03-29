@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.idea/
+.vscode/
+*.pth
+*.pt
+*.ckpt
+*.npz
+# 训练打包与训练输出目录（体积大，本地保留即可）
+seg_model_train/train-result.zip
+**/train-result.zip
+**/train-result/
+
+detect result/*
+!detect result/.gitkeep

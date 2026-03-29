@@ -1,0 +1,122 @@
+# 调试写盘：true 时每帧写 split_vis（整图切分框）+ 各条带 debug_visuals；生产请改 false
+debug_io: true
+
+Consecutive_Check: 0
+Consecutive_thres_num: 30
+anomaly_area_cls_range:
+-   - 0
+    - 20
+-   - 20
+    - 40
+-   - 40
+    - 60
+-   - 60
+    - 80
+-   - 80
+    - 100
+calibrat_cam_id: 2
+cam1_cut_ratio: 3
+cam1_img_size: 256
+cam1_model_name: det_model\train-result\image_data_02_28\CAM1\last.pth
+cam1_eff_ad_ckpt: eff_ad\train-result\image_data_02_27\CAM1\last.pth
+cam1_draem_ckpt: draem_model\train-result\image_data_02_27\CAM1\last.pth
+cam1_draem_seg_anomaly_thres: 0.004
+cam1_seg_anomaly_thres: 0.0
+cam1_patchcore_k: 3.0
+cam1_use_gradient_detection: true
+cam1_grad_threshold: 10
+cam1_blur_ksize: 5
+cam1_edge_crop: 0
+cam1_bg_ksize: 201
+cam1_diff_threshold: 0.5
+# PatchCore：每块正方形热力图边缘抑制
+#   soft_border：过渡带宽（像素），0 表示不按带宽做边缘抑制
+#   strength：抑制强度 0~1，0=完全不抑制，1=最外缘一行/列热力乘权为 0（向内恢复）
+#   weight_profile：过渡曲线。linear=线性 ramp；ease_out_cubic=默认，w=1-(1-t)^3，靠外缘变化快、
+#     靠内缘趋近 1 更缓，减轻后续 H_diff 在「抑制带末端」的伪高亮
+cam1_patchcore_edge_soft_border: 50
+cam1_patchcore_edge_strength: 0.5
+cam1_patchcore_edge_weight_profile: ease_out_cubic
+cam1_standard_ratio_x: 0.4308
+cam1_times: 0.865127
+cam2_cut_ratio: 3
+cam2_img_size: 256
+cam2_model_name: det_model\train-result\image_data_02_28\CAM2\last.pth
+cam2_eff_ad_ckpt: eff_ad\train-result\image_data_02_27\CAM2\last.pth
+cam2_draem_ckpt: draem_model\train-result\image_data_02_27\CAM2\last.pth
+cam2_draem_seg_anomaly_thres: 0.004
+cam2_seg_anomaly_thres: 0.3
+cam2_patchcore_k: 3.0
+cam2_use_gradient_detection: true
+cam2_grad_threshold: 3.5
+cam2_blur_ksize: 5
+cam2_edge_crop: 0
+cam2_bg_ksize: 101
+cam2_diff_threshold: 0.3
+cam2_patchcore_edge_soft_border: 100
+cam2_patchcore_edge_strength: 1
+cam2_patchcore_edge_weight_profile: ease_out_cubic
+cam2_standard_ratio_x: 0.4308
+cam2_times: 0.8121726
+cam3_cut_ratio: 3
+cam3_img_size: 256
+cam3_model_name: det_model\train-result\image_data_02_28\CAM3\last.pth
+cam3_eff_ad_ckpt: eff_ad\train-result\image_data_02_27\CAM3\last.pth
+cam3_draem_ckpt: draem_model\train-result\image_data_02_27\CAM3\last.pth
+cam3_draem_seg_anomaly_thres: 0.004
+cam3_seg_anomaly_thres: 0.3
+cam3_patchcore_k: 3.0
+cam3_use_gradient_detection: true
+cam3_grad_threshold: 2
+cam3_blur_ksize: 5
+cam3_edge_crop: 0
+cam3_bg_ksize: 101
+cam3_diff_threshold: 0.3
+cam3_patchcore_edge_soft_border: 100
+cam3_patchcore_edge_strength: 1
+cam3_patchcore_edge_weight_profile: ease_out_cubic
+cam3_standard_ratio_x: 0.4368
+cam3_times: 0.842561
+cam4_cut_ratio: 3
+cam4_img_size: 256
+cam4_model_name: det_model\train-result\image_data_02_28\CAM4\last.pth
+cam4_eff_ad_ckpt: eff_ad\train-result\image_data_02_27\CAM4\last.pth
+cam4_draem_ckpt: draem_model\train-result\image_data_02_27\CAM4\last.pth
+cam4_draem_seg_anomaly_thres: 0.004
+cam4_seg_anomaly_thres: 0.3
+cam4_patchcore_k: 3.0
+cam4_use_gradient_detection: true
+cam4_grad_threshold: 2
+cam4_blur_ksize: 5
+cam4_edge_crop: 0
+cam4_bg_ksize: 201
+cam4_diff_threshold: 0.5
+cam4_patchcore_edge_soft_border: 50
+cam4_patchcore_edge_strength: 0.5
+cam4_patchcore_edge_weight_profile: ease_out_cubic
+cam4_standard_ratio_x: 0.4368
+cam4_times: 0.83572
+camrea_id_down:
+- '3'
+- '4'
+camrea_id_down_cls: 3
+camrea_id_down_report: '3'
+camrea_id_up:
+- '1'
+- '2'
+camrea_id_up_cls: 2
+camrea_id_up_report: '2'
+cls_model_path: cls_model\cls_checkpoint.pth
+diameter: 607.9
+frequency_bianma: 1000
+frequency_bianma_times: 8
+remove_threshold: 15
+steel_length_range: []
+steel_real_y0: 0
+# 轻量模式相机（0-based）：这些相机只测量幅宽，跳过全量缺陷检测，以释放 GPU 给主检相机（CAM2/CAM3）
+# CAM1=0, CAM2=1, CAM3=2, CAM4=3；改为 [] 可恢复所有相机全量检测
+lite_cam_ids: [0, 3]
+# PatchCore 权重目录名（相对于 patchcore_model/ 下）
+# 使用原版模型：weights
+# 使用 train_v2.py 训练的提速模型（coreset 1% + PCA）：weights_v2
+patchcore_weights_root: weights

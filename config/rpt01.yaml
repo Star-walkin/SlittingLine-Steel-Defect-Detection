@@ -1,0 +1,33 @@
+update_info : True #是否修改报告
+area_range : []
+steel_length_range: []
+class_list : [1,2,3,4] #总共的类别
+class_labels : {
+            1: "划痕",
+            2: "擦伤",
+            3: "污点",
+            4: "穿孔",
+            } #总共的内别
+
+print_cls: [1,2,3] #需要打印的类别
+
+
+updates_up: [{"class_label": "擦伤", "area_interval": "> 100", "new_count": 2},
+           {"class_label": "污点", "area_interval": "0-20", "new_count": 3},]#报告中需要修改的值
+
+updates_down: [{"class_label": "污点", "area_interval": "> 100", "new_count": 5},
+           {"class_label": "擦伤", "area_interval": "0-20", "new_count": 4},]#报告中需要修改的值
+
+
+
+colors : {"划痕": '#FF6347',  # Tomato（红色）
+            "擦伤": '#4682B4',  # SteelBlue（蓝色）
+            "污点": '#32CD32',  # LimeGreen（绿色）
+            "穿孔": '#FFD700'  # Gold（黄色）
+            } #绘图所用的颜色
+data : [[100, 100, 100, 100, 100, 100],
+     [0, 100, 100, 100 ,100, 100],
+     [100, 100, 100, 100 ,100, 100],
+     [100, 100, 100, 100, 100, 9]]
+
+product_cls: "二类"

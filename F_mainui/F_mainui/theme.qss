@@ -1,0 +1,149 @@
+/* SteelDefect UI theme (non-invasive)
+   目标：只美化通用控件，不覆盖你用于图像/波形显示的 QLabel 画布区域（这些通常在 .ui 里单独写了 styleSheet）。
+*/
+
+/* ---- Base ---- */
+QMainWindow {
+    background: #F4F7FB;
+}
+
+QWidget {
+    color: #1E2A39;
+    font-size: 14px;
+}
+
+/* ---- Text / labels ----
+   重点：你反馈的“文字周边出现边框”，多数来自 QLabel 在某些容器/平台主题下被绘制了边框或底色。
+   这里显式清掉 QLabel 的默认边框/背景（不会覆盖你在 .ui 里给特定 QLabel 写的黑色边框/白底，因为控件自身 styleSheet 优先级更高）。
+*/
+QLabel {
+    background: transparent;
+    border: none;
+}
+
+/* ---- Containers ---- */
+QFrame {
+    background: #FFFFFF;
+    border: 1px solid rgba(30, 42, 57, 0.08);
+    border-radius: 10px;
+}
+
+/* 避免边框“贴着文字”，给容器一点内边距（不改变你的绝对布局，只影响绘制区域的留白感） */
+QFrame > QLabel {
+    padding: 0px;
+}
+
+QGroupBox {
+    background: rgba(255, 255, 255, 0.85);
+    border: 1px solid rgba(30, 42, 57, 0.12);
+    border-radius: 10px;
+    margin-top: 12px; /* 给标题留空间 */
+    padding: 10px;
+}
+
+QGroupBox::title {
+    subcontrol-origin: margin;
+    left: 12px;
+    padding: 0 6px;
+    color: #2A3A4E;
+    font-weight: 600;
+}
+
+/* ---- Inputs ---- */
+QLineEdit, QComboBox {
+    background: #FFFFFF;
+    border: 1px solid rgba(30, 42, 57, 0.18);
+    border-radius: 8px;
+    padding: 6px 10px;
+    selection-background-color: #2F6FEB;
+}
+
+QLineEdit:focus, QComboBox:focus {
+    border: 1px solid rgba(47, 111, 235, 0.85);
+    outline: none;
+}
+
+/* QComboBox 下拉区不单独写样式，交给系统/样式引擎绘制默认矩形下拉按钮 */
+
+/* ---- Buttons (only text buttons) ----
+   说明：你界面里很多大按钮是 icon 按钮（text=""），这类按钮我们不强行套“蓝色实心按钮”，避免破坏观感/尺寸。
+*/
+QPushButton {
+    border-radius: 10px;
+    padding: 6px 12px;
+    border: 1px solid rgba(30, 42, 57, 0.16);
+    background: #FFFFFF;
+}
+
+QPushButton:hover {
+    background: rgba(47, 111, 235, 0.06);
+    border-color: rgba(47, 111, 235, 0.35);
+}
+
+QPushButton:pressed {
+    background: rgba(47, 111, 235, 0.10);
+}
+
+/* 对有文字的按钮，给“主按钮”风格（比如：确认、换卷、历史回看等） */
+QPushButton[text]:not([text=""]) {
+    background: #2F6FEB;
+    color: #FFFFFF;
+    border: 1px solid rgba(47, 111, 235, 0.85);
+    font-weight: 600;
+}
+
+QPushButton[text]:not([text=""]):hover {
+    background: #2B63D6;
+}
+
+QPushButton[text]:not([text=""]):pressed {
+    background: #2557BD;
+}
+
+QPushButton:disabled {
+    background: rgba(30, 42, 57, 0.08);
+    color: rgba(30, 42, 57, 0.35);
+    border-color: rgba(30, 42, 57, 0.10);
+}
+
+/* ---- Scroll area / scroll bar ---- */
+QScrollArea {
+    border: none;
+    background: transparent;
+}
+
+QScrollBar:vertical {
+    background: transparent;
+    width: 10px;
+    margin: 6px 3px 6px 3px;
+}
+
+QScrollBar::handle:vertical {
+    background: rgba(30, 42, 57, 0.25);
+    border-radius: 5px;
+    min-height: 30px;
+}
+
+QScrollBar::handle:vertical:hover {
+    background: rgba(30, 42, 57, 0.35);
+}
+
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    height: 0px;
+}
+
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+    background: transparent;
+}
+
+/* ---- Menubar / statusbar (subtle) ---- */
+QMenuBar {
+    background: #FFFFFF;
+    border-bottom: 1px solid rgba(30, 42, 57, 0.10);
+}
+
+QStatusBar {
+    background: #FFFFFF;
+    border-top: 1px solid rgba(30, 42, 57, 0.10);
+}
+

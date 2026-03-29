@@ -1,0 +1,55 @@
+Consecutive_Check: 0
+Consecutive_thres_num: 25
+anomaly_area_cls_range:
+-   - 0
+    - 20
+-   - 20
+    - 40
+-   - 40
+    - 60
+-   - 60
+    - 80
+-   - 80
+    - 100
+calibrat_cam_id: 3
+cam1_cut_ratio: 3
+cam1_img_size: 256
+cam1_model_name: seg_model_train\train-result\image_data_01_24\CAM1\epoch_291.pth
+cam1_seg_anomaly_thres: 0.065
+cam1_standard_ratio_x: 0.424793
+cam1_times: 0.865127
+cam2_cut_ratio: 3
+cam2_img_size: 256
+cam2_model_name: seg_model_train\train-result\image_data_01_24\CAM2\epoch_291.pth
+cam2_seg_anomaly_thres: 0.065
+cam2_standard_ratio_x: 0.45249
+cam2_times: 0.8121726
+cam3_cut_ratio: 3
+cam3_img_size: 256
+cam3_model_name: seg_model_train\train-result\image_data_01_24\CAM3\epoch_291.pth
+cam3_seg_anomaly_thres: 0.085
+cam3_standard_ratio_x: 0.43617
+cam3_times: 0.842561
+cam4_cut_ratio: 3
+cam4_img_size: 256
+cam4_model_name: seg_model_train\train-result\image_data_01_24\CAM4\epoch_291.pth
+cam4_seg_anomaly_thres: 0.065
+cam4_standard_ratio_x: 0.43974
+cam4_times: 0.83572
+camrea_id_down_report: '3'
+camrea_id_up_report: '2'
+camrea_id_down:
+- '3'
+- '4'
+camrea_id_down_cls: 3
+camrea_id_up:
+- '1'
+- '2'
+camrea_id_up_cls: 2
+cls_model_path: cls_model\cls_checkpoint.pth
+diameter: 607.9
+frequency_bianma: 1000
+frequency_bianma_times: 8
+remove_threshold: 15
+steel_length_range: []
+steel_real_y0: 0
