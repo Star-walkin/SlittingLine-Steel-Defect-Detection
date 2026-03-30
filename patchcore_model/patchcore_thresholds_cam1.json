@@ -1,6 +1,0 @@
-{
-  "T_min": 0.0,
-  "K": 3.0,
-  "edge_crop": 50,
-  "memory_path": "patchcore_model\\weights\\image_data_patchcore_0228\\CAM1\\patchcore_memory.npz"
-}

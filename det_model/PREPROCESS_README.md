@@ -17,13 +17,13 @@
 
 1. **生成数据（与离线检测相同预处理）**
    ```bash
-   python det_model/prepare_dataset_det.py --raw_root img_raw_0228 --exp_name image_data_02_27 --out_root image_all
+   python det_model/prepare_dataset_det.py --raw_root D:\pycharm_project\steeldefect\img_raw_0228 --exp_name image_data_02_27 --out_root D:\pycharm_project\steeldefect\image_all
    ```
    会按 `split_multi_strips` 切带、分段，对每块做：**裁 15px → FFT 去纹 → 中值拍平**，写入 `out_root/exp_name/CAMx/train/good/`。
 
 2. **训练时标明“已预处理”**
    ```bash
-   python det_model/train.py --data_root image_all --exp_name image_data_02_27 --preprocessed
+   python det_model/train.py --data_root D:\pycharm_project\steeldefect\image_all --exp_name image_data_02_27 --preprocessed
    ```
    加 `--preprocessed` 后，dataset 不再做 crop 10 与 flatten，只做 normal/anomaly 合成与 resize/ToTensor/Normalize，与推理输入分布一致。
 

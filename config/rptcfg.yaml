@@ -4,12 +4,10 @@ class_labels:
   1: 划痕
   2: 擦伤
   3: 破洞
-  4: '01'
 class_list:
 - 1
 - 2
 - 3
-- 4
 colors:
   划痕: '#FF6347'
   擦伤: '#4682B4'
@@ -91,17 +89,17 @@ data4:
   - 1000
   - 1000
   - 1000
-id: '01'
+id: '03'
 print_cls:
 - 1
 - 2
 - 3
 product_cls: '1'
 product_cls_names:
-  '4': 冷轧
+  '4': 带钢
 steel_length_range: []
 strip_id: '1'
-time: '20260329'
+time: '20260330'
 update_info: false
 updates_down: []
 updates_up: []

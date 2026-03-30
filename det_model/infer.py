@@ -1,6 +1,6 @@
 """
 det_model/infer.py
-SlidingWindowDetector - 在原始分辨率下使用滑动窗口推理，避免缩放损失缺陷信号。
+本目录在 PatchCore-only 版本中仅用于复用“线上一致”的预处理函数。
 """
 
 import os
@@ -16,7 +16,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from function_bank import test_one_image, mean_smoothing
+from app.common.function_bank import test_one_image, mean_smoothing
 
 # 与训练数据预处理一致：FFT 去纹（img_select 相同逻辑），削弱横向条纹
 MASK_WIDTH_FFT = 10
@@ -24,7 +24,7 @@ CENTER_PROTECT_FFT = 15
 
 
 def apply_fft_deripple(gray: np.ndarray) -> np.ndarray:
-    """对灰度图做 FFT 去纹，与 seg_model_train/img_select 中 process_and_save_image 一致。"""
+    """对灰度图做 FFT 去纹（用于与线上推理一致的预处理）。"""
     rows, cols = gray.shape
     dft = cv2.dft(np.float32(gray), flags=cv2.DFT_COMPLEX_OUTPUT)
     dft_shift = np.fft.fftshift(dft)
@@ -253,14 +253,22 @@ def preprocess_like_inference_gpu(
     r = min(W - bias, W)
     if r <= l:
         l, r = 0, W
-    crop = gray[:, l:r].astype(np.float32)
 
-    # 上传到 GPU
-    strip_t = torch.from_numpy(crop).to(device)
+    # 避免在 CPU 上做 gray[:, l:r].astype(float32) 的整块大分配
+    # （这在多相机 + debug 写盘叠加时很容易触发 OOM/碎片化）。
+    sl = gray[:, l:r]
+    if not sl.flags.c_contiguous:
+        sl = np.ascontiguousarray(sl)
 
-    # FFT 去纹 → 纵向滤波 → 背景拍平
+    # 上传到 GPU，并在 GPU 端完成 float32 转换
+    strip_t = torch.from_numpy(sl).to(device=device, dtype=torch.float32, non_blocking=True)
+
+    # FFT 去纹 → 纵向滤波 → 背景拍平（数值流程与旧实现一致）
     strip_t = apply_fft_deripple_gpu(strip_t)
     strip_t = apply_vertical_filter_gpu(strip_t)
     strip_t = flatten_background_gpu(strip_t)
 
-    return strip_t.cpu().numpy().astype(np.uint8)
+    # 与旧实现保持一致：先 clamp 到 [0,255]，再截断到 uint8
+    strip_t = strip_t.clamp(0, 255)
+    out = strip_t.to(torch.uint8).contiguous().cpu().numpy()
+    return out

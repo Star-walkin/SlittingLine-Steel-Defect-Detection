@@ -1,6 +1,6 @@
 """
 det_model/prepare_dataset_det.py
-将原始图像处理成与「离线检测」完全一致的预处理，生成可直接用于 SimpleAD 训练的数据集。
+将原始图像处理成与「线上推理」一致的预处理（供 PatchCore/离线工具复用）。
 
 与离线检测对齐的预处理流程（与 det_model/infer.py SlidingWindowDetector.detect_ano 一致）：
   1. 灰度
@@ -9,7 +9,7 @@ det_model/prepare_dataset_det.py
   4. 纵向滤波（apply_vertical_filter）：去除轧制纹/列 PRNU
   5. 背景拍平：中值滤波 + 减背景 + 背景均值补偿
 
-数据集步骤沿用 seg_model_train/data_prepare.py：
+数据集步骤：
   - 使用 function_bank.split_multi_strips 切带
   - 按条带竖直分段，输出到 CAMx/train/good/
 
@@ -34,7 +34,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from function_bank import split_multi_strips as fb_split_multi_strips
+from app.common.function_bank import split_multi_strips as fb_split_multi_strips
 from det_model.infer import apply_fft_deripple, apply_vertical_filter
 
 
@@ -81,8 +81,8 @@ def list_images(folder: str, exts=("*.png", "*.jpg", "*.jpeg", "*.bmp")):
 
 def main():
     p = argparse.ArgumentParser(description="生成与离线检测预处理一致的 SimpleAD 训练数据集")
-    p.add_argument("--raw_root", type=str, default=r"img_raw_0228")
-    p.add_argument("--out_root", type=str, default=r"image_all")
+    p.add_argument("--raw_root", type=str, default=r"D:\pycharm_project\steeldefect\img_raw_0228")
+    p.add_argument("--out_root", type=str, default=r"D:\pycharm_project\steeldefect\image_all")
     p.add_argument("--exp_name", type=str, default="image_data_02_28")
     p.add_argument("--cam_names", type=str, nargs="+",
                    default=["cam1_filter", "cam2_filter", "cam3_filter", "cam4_filter"])

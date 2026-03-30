@@ -1,0 +1,12 @@
+{
+  "camera": "CAM4",
+  "data_dir": "D:\\pycharm_project\\steeldefect\\image_all\\image_data_02_27\\CAM4",
+  "num_images": 180,
+  "memory_bank_size": 18432,
+  "embedding_dim": 384,
+  "img_size": 256,
+  "coreset_ratio": 0.1,
+  "threshold_percentile": 99.5,
+  "score_threshold": 0.005524271633476019,
+  "epoch": 30
+}
