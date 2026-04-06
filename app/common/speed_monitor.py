@@ -68,7 +68,7 @@
 """
 
 import os
-_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 import time
 import threading
 from typing import Optional, Dict

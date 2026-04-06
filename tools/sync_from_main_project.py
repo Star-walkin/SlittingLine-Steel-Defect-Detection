@@ -39,22 +39,28 @@ UI_FILES = [
     "report_change.py",
     "report_center.py",
     "cls_config.py",
+    "cls_train_window.py",
+    "cls_wizard.py",
+    "cls_model_registry.py",
     "report.py",
     "make_standard.py",
     "theme.qss",
     "requirements.txt",
 ]
 
-ROOT_FILES = [
-    "detect_anomalies_online.py",
-    "gen_report_cls.py",
-    "function_bank.py",
-    "util.py",
-    "speed_monitor.py",
-    "cls_anomalies.py",
-    "cls_model.py",
-    "table.json",
-]
+ROOT_FILE_MAP = {
+    # online / report entrypoints
+    "detect_anomalies_online.py": Path("app") / "online" / "detect_anomalies_online.py",
+    "gen_report_cls.py": Path("app") / "report" / "gen_report_cls.py",
+    # common libs
+    "function_bank.py": Path("app") / "common" / "function_bank.py",
+    "util.py": Path("app") / "common" / "util.py",
+    "speed_monitor.py": Path("app") / "common" / "speed_monitor.py",
+    "cls_anomalies.py": Path("app") / "common" / "cls_anomalies.py",
+    "cls_model.py": Path("app") / "common" / "cls_model.py",
+    # data
+    "table.json": Path("table.json"),
+}
 
 CONFIG_FILES = [
     "config.yaml",
@@ -67,6 +73,7 @@ CONFIG_FILES = [
 ]
 
 DIRS_TO_SYNC = [
+    # PatchCore 代码（移动到 models/ 下）
     "patchcore_model",
     "cls_model",
     # PatchCore-only：det_model 仅保留 PatchCore 复用的预处理代码
@@ -199,6 +206,81 @@ def _portableize_python_paths(py: str) -> str:
     return py
 
 
+def _post_sync_fixups() -> None:
+    """
+    将主工程 UI 脚本里的“启动脚本路径”修正为本仓库的模块化结构：
+    - 在线检测：python -m app.online.detect_anomalies_online
+    - 报告生成：python -m app.report.gen_report_cls
+    - 生成 table.json：ui/make_standard.py
+    """
+    ui_main = DEST_ROOT / "ui" / "main.py"
+    if ui_main.exists():
+        s = _read_text(ui_main)
+        # 工作目录保持仓库根；启动改为 -m
+        s = re.sub(
+            r"self\.python_process\.start\(\s*python_exe\s*,\s*\[\s*\"-u\"\s*,\s*py_script\s*\]\s*\)",
+            "self.python_process.start(python_exe, [\"-u\", \"-m\", \"app.online.detect_anomalies_online\"])",
+            s,
+        )
+        # 去掉 py_script 变量赋值（若存在）
+        s = re.sub(r"^\s*py_script\s*=\s*.*detect_anomalies_online\.py.*\n", "", s, flags=re.M)
+        _write_text(ui_main, s)
+
+    ui_report_change = DEST_ROOT / "ui" / "report_change.py"
+    if ui_report_change.exists():
+        s = _read_text(ui_report_change)
+        # repo_root 与 make_standard 路径
+        s = re.sub(
+            r"_MAKE_STD_SCRIPT\s*=\s*os\.path\.join\(_REPO_ROOT,\s*\".*?make_standard\.py\"\)",
+            "_MAKE_STD_SCRIPT   = os.path.join(_REPO_ROOT, \"ui\", \"make_standard.py\")",
+            s,
+        )
+        # 报告脚本改为 -m 模块
+        s = re.sub(
+            r"_GEN_REPORT_SCRIPT\s*=\s*os\.path\.join\(_REPO_ROOT,\s*\"gen_report_cls\.py\"\)",
+            "_GEN_REPORT_MODULE = \"app.report.gen_report_cls\"",
+            s,
+        )
+        s = s.replace("_GEN_REPORT_SCRIPT", "_GEN_REPORT_MODULE")
+        # args 中插入 -m
+        s = re.sub(
+            r"(\[\s*_PYTHON_EXE\s*,\s*\"-u\"\s*,)\s*_GEN_REPORT_MODULE\s*,",
+            r"\1 \"-m\", _GEN_REPORT_MODULE,",
+            s,
+        )
+        _write_text(ui_report_change, s)
+
+    ui_report_center = DEST_ROOT / "ui" / "report_center.py"
+    if ui_report_center.exists():
+        s = _read_text(ui_report_center)
+        # _GEN_REPORT_SCRIPT → module
+        s = re.sub(
+            r"_GEN_REPORT_SCRIPT\s*=\s*os\.path\.join\(_PROJECT_ROOT,\s*\"gen_report_cls\.py\"\)",
+            "_GEN_REPORT_MODULE = \"app.report.gen_report_cls\"",
+            s,
+        )
+        # args 头改为 -u -m module
+        s = re.sub(
+            r"args\s*=\s*\[\s*_GEN_REPORT_SCRIPT\s*,",
+            "args = [\n            \"-u\",\n            \"-m\",\n            _GEN_REPORT_MODULE,",
+            s,
+        )
+        # 确保 import sys（主工程里可能已存在；重复也无害但我们避免）
+        if re.search(r"^\s*import\s+sys\s*$", s, flags=re.M) is None:
+            s = s.replace("from report_change import ReportWindow\n", "from report_change import ReportWindow\nimport sys\n")
+        _write_text(ui_report_center, s)
+
+    ui_cls_cfg = DEST_ROOT / "ui" / "cls_config.py"
+    if ui_cls_cfg.exists():
+        s = _read_text(ui_cls_cfg)
+        s = re.sub(
+            r"_MAKE_STD\s*=\s*r?\".*?make_standard\.py\"",
+            "_MAKE_STD     = os.path.join(_REPO_ROOT, \"ui\", \"make_standard.py\")",
+            s,
+        )
+        _write_text(ui_cls_cfg, s)
+
+
 def _sync_file(src: Path, dst: Path, *, kind: str) -> None:
     if not src.exists():
         raise FileNotFoundError(str(src))
@@ -248,13 +330,13 @@ def main() -> int:
             kind="py_ui" if fn.endswith(".py") else "raw",
         )
 
-    # 2) 根目录脚本/模块
-    for fn in ROOT_FILES:
-        src = source_root / fn
-        dst = DEST_ROOT / fn
-        if fn.endswith(".py"):
+    # 2) 根目录脚本/模块（映射到新的目录结构）
+    for src_name, rel_dst in ROOT_FILE_MAP.items():
+        src = source_root / src_name
+        dst = DEST_ROOT / rel_dst
+        if src_name.endswith(".py"):
             _sync_file(src, dst, kind="py_root")
-        elif fn.endswith(".json"):
+        elif src_name.endswith(".json"):
             _sync_file(src, dst, kind="yaml_json")
         else:
             _sync_file(src, dst, kind="raw")
@@ -270,7 +352,10 @@ def main() -> int:
     # 4) 目录同步（先整体覆盖，后续 patchcore-only 会进一步裁剪）
     for d in DIRS_TO_SYNC:
         src_dir = source_root / d
-        dst_dir = DEST_ROOT / d
+        if d == "patchcore_model":
+            dst_dir = DEST_ROOT / "models" / "patchcore_model"
+        else:
+            dst_dir = DEST_ROOT / d
         if not src_dir.is_dir():
             continue
         if dst_dir.exists():
@@ -307,6 +392,8 @@ def main() -> int:
     # 5) 基础运行目录占位
     (DEST_ROOT / "detect result").mkdir(parents=True, exist_ok=True)
     (DEST_ROOT / "detect result" / ".gitkeep").write_text("", encoding="utf-8")
+
+    _post_sync_fixups()
 
     print("[OK] synced from", str(source_root))
     return 0

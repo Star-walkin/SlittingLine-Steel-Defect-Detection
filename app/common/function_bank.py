@@ -2,7 +2,7 @@ import matplotlib
 import random
 import matplotlib.pyplot as plt
 import cv2
-from app.common.util import mean_smoothing, MSGMSLoss
+from util import mean_smoothing, MSGMSLoss
 import numpy as np
 import torch
 import torchvision.transforms as transforms
@@ -15,7 +15,7 @@ import pandas as pd
 import json
 import serial
 import os
-_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 from datetime import datetime, timedelta
 import torch.nn.functional as F
 import itertools
@@ -24,6 +24,73 @@ try:
     from scipy.ndimage import median_filter as scipy_median_filter
 except Exception:
     scipy_median_filter = None
+
+
+def area_val_matches_print_area_filter(area_val: float, area_range) -> bool:
+    """
+    与「打印面积」多选一致：支持
+    - []：不过滤
+    - [lo, hi]：标量闭区间（兼容旧配置）
+    - [lo]：>= lo
+    - [[a,b],[c,d],[max_end, None]]：多段 OR；尾段 [L, None] 表示 >= L（对应 \"> L\" 列，与 create_area_table 中 area>=max_end 一致）
+    """
+    try:
+        area_val = float(area_val)
+    except Exception:
+        return False
+    if area_range is None:
+        return True
+    if not isinstance(area_range, (list, tuple)) or len(area_range) == 0:
+        return True
+    first = area_range[0]
+    if isinstance(first, (list, tuple)):
+        for seg in area_range:
+            if not isinstance(seg, (list, tuple)) or len(seg) < 1:
+                continue
+            try:
+                lo = float(seg[0])
+            except Exception:
+                continue
+            hi = seg[1] if len(seg) > 1 else None
+            if hi is None:
+                if area_val >= lo:
+                    return True
+            else:
+                try:
+                    hi = float(hi)
+                except Exception:
+                    continue
+                if lo <= area_val < hi:
+                    return True
+        return False
+    if len(area_range) == 2:
+        try:
+            return float(area_range[0]) <= area_val <= float(area_range[1])
+        except Exception:
+            return True
+    if len(area_range) == 1:
+        try:
+            return area_val >= float(area_range[0])
+        except Exception:
+            return True
+    return True
+
+
+def resolve_area_table_column_key(area_interval_raw: str, area_table: pd.DataFrame) -> str:
+    """
+    将 rptcfg/UI 中的 area_interval 对齐到 create_area_table 生成的列名。
+    常见错误：去掉全部空格会把 \"> 100\" 变成 \">100\"，与列名 \"> 100\" 不一致导致 KeyError，
+    select_anomalies 整段 updates 回退后报告与细节优化完全对不上。
+    """
+    raw = (area_interval_raw or "").strip()
+    cols = list(area_table.columns)
+    if raw in cols:
+        return raw
+    compact = raw.strip("[]").replace(",", "-").replace(" ", "")
+    for c in cols:
+        if str(c).replace(" ", "") == compact:
+            return c
+    return raw
 
 
 def flatten_background_subtraction(gray: np.ndarray, kernel_size: int = None) -> np.ndarray:
@@ -484,12 +551,20 @@ class test_one_image(torch.nn.Module):
 
         original_strip_for_crop: 可选，与 detect_ano 输入同一条带原图（H×W 或 H×W×3）。
             若提供且 detect_ano 已缓存 _last_tiles_u8，则 defect_images 从原图裁 DEFECT_PATCH_SIDE 正方形；
-            JSON 中的 real_x/real_y 仍按原公式写入（业务坐标系），与像素裁剪独立。
+            JSON 中的 real_x：cx 按热力图宽度 Wm 线性映射到幅宽 mm；real_y：cy 按高度 Hm 映射，与像素裁剪独立。
         """
         center_coords, area_list = [], []
+        # amap 与 test_cut：纵向为 cut_ratio 个 tile 拼接 → 高 Hm = img_size*cut_ratio，宽 Wm = img_size。
+        # 幅宽方向 cx 只应除以 Wm；误用 (img_size*cut_ratio) 会把 real_x 压窄到约 fukuan/cut_ratio。
+        Hm, Wm = int(amap.shape[0]), int(amap.shape[1])
+        if Wm < 1:
+            Wm = int(self.img_size)
+        if Hm < 1:
+            Hm = int(self.img_size * self.cut_ratio)
+        Hf, Wf = float(Hm), float(Wm)
 
         try:
-            from models.patchcore_model.local_contrast_defect import detect_defects_by_local_contrast
+            from patchcore_model.local_contrast_defect import detect_defects_by_local_contrast
             local_contrast_available = True
         except ImportError:
             detect_defects_by_local_contrast = None
@@ -521,12 +596,12 @@ class test_one_image(torch.nn.Module):
 
                 real_area = int(
                     area
-                    * (4096 * self.standard_ratio_y) / (self.img_size * self.cut_ratio)
-                    * (fukuan_val / (self.img_size * self.cut_ratio))
+                    * (4096 * self.standard_ratio_y) / Hf
+                    * (fukuan_val / Wf)
                 )
-                real_x = int(fukuan_val / (self.img_size * self.cut_ratio) * cx)
+                real_x = int(fukuan_val / Wf * cx)
                 real_y = int(4096 * self.standard_ratio_y *
-                             (cy / (self.img_size * self.cut_ratio) + image_id)
+                             (cy / Hf + image_id)
                              + self.steel_real_y0)
 
                 save_name = f"{real_x}_{real_y}_{real_area}_img{image_id}.png"
@@ -546,7 +621,7 @@ class test_one_image(torch.nn.Module):
 
         # ---------- 回退：局部对比度模块不可用时保留原逻辑 ----------
         try:
-            from models.patchcore_model.gradient_defect import detect_defects_by_gradient
+            from patchcore_model.gradient_defect import detect_defects_by_gradient
             gradient_available = True
         except ImportError:
             detect_defects_by_gradient = None
@@ -573,12 +648,12 @@ class test_one_image(torch.nn.Module):
                 x, y, w, h = cv2.boundingRect(contour)
                 cx, cy = x + w // 2, y + h // 2
                 real_area = int(
-                    area * (4096 * self.standard_ratio_y) / (self.img_size * self.cut_ratio)
-                    * (fukuan_val / (self.img_size * self.cut_ratio))
+                    area * (4096 * self.standard_ratio_y) / Hf
+                    * (fukuan_val / Wf)
                 )
-                real_x = int(fukuan_val / (self.img_size * self.cut_ratio) * cx)
+                real_x = int(fukuan_val / Wf * cx)
                 real_y = int(4096 * self.standard_ratio_y *
-                             (cy / (self.img_size * self.cut_ratio) + image_id) + self.steel_real_y0)
+                             (cy / Hf + image_id) + self.steel_real_y0)
                 save_name = f"{real_x}_{real_y}_{real_area}_img{image_id}.png"
                 if not self._save_defect_patch_from_detection(
                     anomaly_save_path,
@@ -597,11 +672,11 @@ class test_one_image(torch.nn.Module):
             cx = test_img.shape[1] // 2
             cy = test_img.shape[0] // 2
             real_x = int(cx) if fukuan is None else int(
-                fukuan / (self.img_size * self.cut_ratio) * cx
+                fukuan / Wf * cx
             )
             real_y = int(
                 4096 * self.standard_ratio_y *
-                (cy / (self.img_size * self.cut_ratio) + image_id)
+                (cy / Hf + image_id)
                 + self.steel_real_y0
             )
             center_coords.append((real_x, real_y))
@@ -635,12 +710,12 @@ class test_one_image(torch.nn.Module):
             cx, cy = x + w // 2, y + h // 2
             real_area = int(
                 area
-                * (4096 * self.standard_ratio_y) / (self.img_size * self.cut_ratio)
-                * (fukuan_val / (self.img_size * self.cut_ratio))
+                * (4096 * self.standard_ratio_y) / Hf
+                * (fukuan_val / Wf)
             )
-            real_x = int(fukuan_val / (self.img_size * self.cut_ratio) * cx)
+            real_x = int(fukuan_val / Wf * cx)
             real_y = int(4096 * self.standard_ratio_y *
-                         (cy / (self.img_size * self.cut_ratio) + image_id)
+                         (cy / Hf + image_id)
                          + self.steel_real_y0)
             save_name = f"{real_x}_{real_y}_{real_area}_img{image_id}.png"
             if not self._save_defect_patch_from_detection(
@@ -795,11 +870,12 @@ class Consecutive_anomaly_Checker:
 
 class Statistic_anomaly:
     def __init__(self, conduct_id, fukuan, range, result_path, start_time, remove_threshold, steel_length_range,
-                 update_info, standard_area_tables, colors, class_labels, cls_all, area_range):
+                 update_info, standard_area_tables, colors, class_labels, cls_all, area_range, strip_card_no=""):
         self.fukuan = fukuan
         # 设置字体为新罗马字体
         self.range = range
         self.conduct_id = conduct_id
+        self.strip_card_no = str(strip_card_no or "").strip()
         self.result_path = result_path
         self.start_time = start_time
         self.remove_threshold = remove_threshold
@@ -828,21 +904,89 @@ class Statistic_anomaly:
             pass
         return float(fallback)
 
-    def select_anomalies(self, anomalies_info, strip_id, print_cls, surface, updates):
-        select_info_coords = {}
-        select_info_area = {}
+    def _column_names_for_print_area_segments(self, table_columns):
+        """按「打印面积」多段配置，得到报告图中应保留的列名（顺序与 table_columns 一致）。"""
+        cols = list(table_columns)
+        ar = self.area_range
+        if ar is None or not isinstance(ar, (list, tuple)) or len(ar) == 0:
+            return cols
+        first = ar[0]
+        if not isinstance(first, (list, tuple)):
+            return cols
+        max_end = float(self.range[-1][1])
+        want = set()
+        for seg in ar:
+            if not isinstance(seg, (list, tuple)) or len(seg) < 1:
+                continue
+            try:
+                lo = float(seg[0])
+            except Exception:
+                continue
+            hi = seg[1] if len(seg) > 1 else None
+            if hi is None:
+                want.add(f"> {max_end}")
+            else:
+                try:
+                    hi = float(hi)
+                except Exception:
+                    continue
+                hit = False
+                for start, end in self.range:
+                    fs, fe = float(start), float(end)
+                    if abs(lo - fs) < 1e-9 and abs(hi - fe) < 1e-9:
+                        want.add(f"{start}-{end}")
+                        hit = True
+                        break
+                if not hit:
+                    for c in cols:
+                        cs = str(c).strip()
+                        if cs.startswith(">"):
+                            continue
+                        if "-" not in cs:
+                            continue
+                        parts = cs.split("-", 1)
+                        try:
+                            if abs(float(parts[0]) - lo) < 1e-6 and abs(float(parts[1]) - hi) < 1e-6:
+                                want.add(c)
+                                break
+                        except Exception:
+                            pass
+        sel = [c for c in cols if c in want]
+        return sel if sel else cols
 
-        # 初始化
+    def _subset_area_table_for_report(self, df, allowed_row_labels):
+        """仅用于报告 PNG：按打印类别行 + 打印面积列取子表，不改内存中的全量统计表。"""
+        if df is None or len(getattr(df, "index", [])) == 0:
+            return df
+        rows = set(allowed_row_labels or [])
+        if rows:
+            row_sel = [r for r in df.index if r in rows]
+            if not row_sel:
+                row_sel = list(df.index)
+        else:
+            row_sel = list(df.index)
+        col_sel = self._column_names_for_print_area_segments(df.columns)
+        try:
+            return df.loc[row_sel, col_sel].copy()
+        except Exception:
+            return df.loc[row_sel].copy()
+
+    def select_anomalies(self, anomalies_info, strip_id, print_cls, surface, updates):
+        select_info_area = {}
+        select_info_triplets = {}
+
         for cls in self.cls_all:
             select_info_area[int(cls)] = []
-            select_info_coords[int(cls)] = []
+            select_info_triplets[int(cls)] = []
 
         clean_info = {int(k): v for k, v in anomalies_info.items()}
+        label_map = {int(k): v for k, v in self.class_labels.items()}
 
         print(f"\n--- {surface}表面 诊断开始 ---")
-        print(f"当前判定标准: 长度范围={self.steel_length_range}, 面积范围={self.area_range}")
+        print(f"当前判定标准: 长度范围={self.steel_length_range}, 打印面积/类别仅作用于报告图与报告表")
 
-        for cls_raw in print_cls:
+        eff_print_cls = list(print_cls) if print_cls else list(self.cls_all or [])
+        for cls_raw in self.cls_all:
             cls = int(cls_raw)
             if cls not in clean_info:
                 continue
@@ -855,71 +999,84 @@ class Statistic_anomaly:
                 y_val = round(float(y_coords) / 1e6, 3)
                 area_val = float(area)
 
-                # --- 深度诊断打印 ---
                 len_ok = True
                 if len(self.steel_length_range) == 2:
                     len_ok = self.steel_length_range[0] <= y_val <= self.steel_length_range[1]
 
-                area_ok = True
-                if len(self.area_range) == 2:
-                    area_ok = self.area_range[0] <= area_val <= self.area_range[1]
-                elif len(self.area_range) == 1:
-                    area_ok = area_val >= self.area_range[0]
-
-                # 如果数据被过滤，打印原因
-                if not (len_ok and area_ok):
-                    print(f"  [过滤] 坐标({x_val}, {y_val}) 面积({area_val}): "
-                          f"长度通过={len_ok}, 面积通过={area_ok}")
+                if not len_ok:
+                    print(f"  [过滤] 坐标({x_val}, {y_val}) 面积({area_val}): 长度未通过")
                 else:
                     select_info_area[cls].append(area_val)
-                    select_info_coords[cls].append((x_val, y_val))
+                    select_info_triplets[cls].append((x_val, y_val, area_val))
 
-        total_found = sum(len(v) for v in select_info_coords.values())
-        print(f"--- {surface}表面 最终筛选出 {total_found} 个缺陷 ---\n")
-
-        # 映射中文标签和绘图逻辑（保持之前的修改）
-        final_coords_for_draw = {}
-        label_map = {int(k): v for k, v in self.class_labels.items()}
-        for cls_id, pts in select_info_coords.items():
-            label_text = label_map.get(cls_id, str(cls_id))
-            final_coords_for_draw[label_text] = pts
+        total_found = sum(len(v) for v in select_info_triplets.values())
+        print(f"--- {surface}表面 参与统计缺陷数 {total_found}（全量进表，打印筛选用在导出图） ---\n")
 
         standard_area_table, indices_dict = self.create_area_table(select_info_area)
+        merged_triplets = {}
 
-        # 若开启“报告修改”模式，允许通过 updates_* 覆盖表格计数，并同步筛选参与绘图的缺陷点
         if self.update_info and isinstance(updates, list) and len(updates) > 0:
             try:
                 standard_area_table, indices_dict = self.batch_update_table_and_indices(
                     standard_area_table, indices_dict, updates
                 )
-                merged_indices = self.merge_indices_by_class(indices_dict)  # class_label -> [idx,...]
-
-                # 根据 merged_indices 对坐标做同样的抽样（索引与 select_info_coords/area 一致）
-                final_coords_for_draw = {}
+                merged_indices = self.merge_indices_by_class(indices_dict)
                 inv_label_map = {v: int(k) for k, v in label_map.items()}
                 for class_label_text, idx_list in merged_indices.items():
                     cls_id = inv_label_map.get(class_label_text)
                     if cls_id is None:
                         continue
-                    src_pts = select_info_coords.get(int(cls_id), [])
-                    picked = [src_pts[i] for i in idx_list if 0 <= i < len(src_pts)]
-                    final_coords_for_draw[class_label_text] = picked
+                    tr = select_info_triplets.get(int(cls_id), [])
+                    merged_triplets[class_label_text] = [tr[i] for i in idx_list if 0 <= i < len(tr)]
             except Exception as e:
-                # 修改失败不影响原始报告生成，回退到未修改版本
-                print(f"[WARN] 应用报告修改 updates 失败，已回退原始统计：{e}")
+                import traceback
 
-        # 先缓存分布图数据，待上下表面都准备好后统一用同一 xmax 绘制
+                print(f"[WARN] 应用报告修改 updates 失败，已回退原始统计：{e}")
+                traceback.print_exc()
+                for cls_id, trs in select_info_triplets.items():
+                    lab = label_map.get(cls_id, str(cls_id))
+                    merged_triplets[lab] = list(trs)
+        else:
+                for cls_id, trs in select_info_triplets.items():
+                    lab = label_map.get(cls_id, str(cls_id))
+                    merged_triplets[lab] = list(trs)
+
+        self.final_area_tables[surface] = standard_area_table.copy()
+
+        allowed_labels = set()
+        for c in eff_print_cls:
+            try:
+                cid = int(c)
+            except Exception:
+                continue
+            lab = label_map.get(cid)
+            if lab is not None:
+                allowed_labels.add(lab)
+        if not allowed_labels:
+            allowed_labels = set(standard_area_table.index)
+
+        table_report = self._subset_area_table_for_report(standard_area_table, allowed_labels)
+        coords_report = {}
+        for lab, trs in merged_triplets.items():
+            if lab not in allowed_labels:
+                continue
+            coords_report[lab] = [
+                (x, y)
+                for x, y, a in trs
+                if area_val_matches_print_area_filter(a, self.area_range)
+            ]
+        coords_report = self._pad_coords_to_match_area_table_rows(coords_report, table_report)
+
         xmax_km = self.steel_length_range[-1] if self.steel_length_range else 0
         if xmax_km <= 0:
-            xmax_km = self._compute_xmax_km_from_coords(final_coords_for_draw, fallback=1.0)
+            xmax_km = self._compute_xmax_km_from_coords(coords_report, fallback=1.0)
 
         self._dist_pending.setdefault(strip_id, {})
         self._dist_pending[strip_id][surface] = {
-            "coords": final_coords_for_draw,
+            "coords": coords_report,
             "xmax": float(xmax_km),
         }
 
-        # 如果上下表面都齐了，则取最大长度统一绘制两张分布图
         if "上" in self._dist_pending[strip_id] and "下" in self._dist_pending[strip_id]:
             xmax_shared = max(
                 self._dist_pending[strip_id]["上"]["xmax"],
@@ -931,14 +1088,12 @@ class Statistic_anomaly:
             self.draw_anomaly_distribution(
                 self._dist_pending[strip_id]["下"]["coords"], strip_id, surface="下", xmax_override=xmax_shared
             )
-            # 清理该 strip 的缓存，避免跨 strip 串扰
             try:
                 del self._dist_pending[strip_id]
             except Exception:
                 pass
 
-        self.draw_anomaly_area_cls(standard_area_table, strip_id, surface=surface)
-        self.final_area_tables[surface] = standard_area_table
+        self.draw_anomaly_area_cls(table_report, strip_id, surface=surface)
 
     # 根据索引字典A，从字典B提取对应的数据
     # 根据索引字典A，从字典B提取对应的数据
@@ -1085,37 +1240,51 @@ class Statistic_anomaly:
         indices_dict: dict, 存储类别和区间对应的索引
         updates: list, 包含更新信息的字典列表，每个字典包含类标签、区间、和新计数值
         """
+        baseline = area_table.copy()
         for update in updates:
-            class_label = update['class_label']
-            area_interval = update['area_interval']
-            area_interval = area_interval.strip("[]").replace(",", "-")
-            area_interval = area_interval.replace(" ", "")
-            new_count = update['new_count']
+            class_label = update["class_label"]
+            raw_iv = update.get("area_interval", "")
+            area_interval = resolve_area_table_column_key(str(raw_iv), area_table)
+            try:
+                new_count = int(update["new_count"])
+            except Exception:
+                continue
+            if new_count < 0:
+                continue
+            if class_label not in area_table.index:
+                print(f"[WARN] 细节优化跳过未知类别: {class_label!r}")
+                continue
+            if area_interval not in area_table.columns:
+                print(
+                    f"[WARN] 细节优化跳过未知区间: 原始={raw_iv!r} 解析={area_interval!r} "
+                    f"可选列={list(area_table.columns)}"
+                )
+                continue
 
-            # 获取原始数目
-            original_count = area_table.loc[class_label, area_interval]
+            original_count = int(baseline.loc[class_label, area_interval])
+            if new_count == original_count:
+                continue
 
-            # 检查新数目是否大于原始数目
             if new_count > original_count:
                 print(
-                    f"警告: {class_label} 类别的 {area_interval} 区间的新数目 ({new_count}) 超出了原始数目 ({original_count})，将其限制为原始数目")
-                new_count = original_count  # 或者抛出异常 raise ValueError("New count exceeds original count")
+                    f"提示: {class_label} / {area_interval} 表格计数改为 {new_count}（检出 {original_count}）；"
+                    f"分布图点数用放回抽样凑足，可能与表格不完全一一对应。"
+                )
 
-            # 更新表格中的数据
             area_table.loc[class_label, area_interval] = new_count
 
-            # 获取该类别和区间的索引列表
             current_indices = indices_dict[class_label][area_interval]
-
-            # 如果该区间有索引，随机选择一个索引并修改
-            if current_indices:
-                # 更新表格
-                area_table.loc[class_label, area_interval] = new_count
-                # 随机选择与新数目相同数量的索引
+            if new_count == 0:
+                indices_dict[class_label][area_interval] = []
+                continue
+            if not current_indices:
+                indices_dict[class_label][area_interval] = []
+                continue
+            if new_count <= len(current_indices):
                 selected_indices = random.sample(current_indices, new_count)
-                # 更新索引字典
-                indices_dict[class_label][area_interval] = selected_indices
-        # 返回更新后的表格和索引字典
+            else:
+                selected_indices = random.choices(current_indices, k=new_count)
+            indices_dict[class_label][area_interval] = selected_indices
         return area_table, indices_dict
 
     # 更新索引字典，将每个类别下的所有区间的索引合并在一起
@@ -1132,10 +1301,87 @@ class Statistic_anomaly:
 
         return merged_dict
 
+    def _random_defect_xy_for_plot(self):
+        """人工补点：横轴幅宽 mm、纵轴钢带长度 km，与分布图一致。"""
+        try:
+            x_max = float(self.fukuan)
+        except Exception:
+            x_max = 100.0
+        if x_max <= 0:
+            x_max = 100.0
+        sr = self.steel_length_range
+        if isinstance(sr, (list, tuple)) and len(sr) == 2:
+            y_lo, y_hi = float(sr[0]), float(sr[1])
+        else:
+            y_lo = 0.0
+            y_hi = max(0.001, float(self._compute_xmax_km_from_coords({}, fallback=1.0)))
+        if y_hi <= y_lo:
+            y_hi = y_lo + 1.0
+        return (random.uniform(0.0, x_max), random.uniform(y_lo, y_hi))
+
+    def _pad_coords_to_match_area_table_rows(self, coords_by_label, area_table):
+        """面积统计表（含细节优化）行合计大于当前散点数时，随机补点以便分布图与表格同步。"""
+        if area_table is None or len(getattr(area_table, "index", [])) == 0:
+            return dict(coords_by_label or {})
+        out = {}
+        for k, v in (coords_by_label or {}).items():
+            out[k] = list(v) if v is not None else []
+        for class_label in area_table.index:
+            try:
+                target = int(area_table.loc[class_label].sum())
+            except Exception:
+                continue
+            cur_list = list(out.get(class_label, []))
+            need = target - len(cur_list)
+            if need <= 0:
+                continue
+            for _ in range(need):
+                cur_list.append(self._random_defect_xy_for_plot())
+            out[class_label] = cur_list
+        return out
+
     def draw_anomaly_distribution(self, coordinates, strip_id, surface, xmax_override=None):
         # 创建一个新的图像
         matplotlib.rcParams['font.sans-serif'] = ['SimHei']  # 黑体
         fig, ax = plt.subplots(figsize=(10, 3))
+        # colors 配置可能缺项（例如 class_labels 改名但 colors 未同步），这里给一个稳定回退色，避免 KeyError 中断报告生成
+        default_cycle = [
+            "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728",
+            "#9467bd", "#8c564b", "#e377c2", "#7f7f7f",
+            "#bcbd22", "#17becf",
+        ]
+
+        def _pick_color(label: str) -> str:
+            try:
+                c = self.colors.get(label, None) if isinstance(self.colors, dict) else None
+                if c:
+                    return c
+            except Exception:
+                pass
+            idx = abs(hash(str(label))) % len(default_cycle)
+            return default_cycle[idx]
+
+        # 横轴：钢带长度(km)；纵轴：缺陷在宽度方向的坐标(mm)。
+        # 检测端 obtain_anomaly_location 里 real_x 按「当时传入的 fukuan_val（多为实测幅宽）」映射，
+        # 而报告侧 self.fukuan 来自 config0 标称幅宽（如 50mm）。二者不一致时，若仍固定 ylim=标称值，
+        # 大量点会落在可视区域外，造成「表格有计数、分布图几乎没点」的假象。
+        all_width_mm = []
+        for _pts in (coordinates or {}).values():
+            for _p in _pts or []:
+                try:
+                    if len(_p) >= 1:
+                        all_width_mm.append(float(_p[0]))
+                except Exception:
+                    pass
+        try:
+            f0 = float(self.fukuan) if self.fukuan is not None else 0.0
+        except Exception:
+            f0 = 0.0
+        y_hi = f0 if f0 > 0 else 50.0
+        if all_width_mm:
+            y_hi = max(y_hi, max(all_width_mm) * 1.08 + 1e-6)
+        y_hi = max(y_hi, 1.0)
+
         # 绘制每个类别的点
         for class_label, points in coordinates.items():
             print("示例缺陷坐标前 5 个：", list(points)[:5])
@@ -1144,7 +1390,7 @@ class Statistic_anomaly:
                 # 拆解坐标
                 x_vals, y_vals = zip(*points)
                 ax.scatter(y_vals, x_vals,  # <——交换横纵轴
-                           color=self.colors[class_label],
+                           color=_pick_color(class_label),
                            label=class_label,
                            s=8)
         # 添加图例
@@ -1155,7 +1401,7 @@ class Statistic_anomaly:
         # 设置 x 轴和 y 轴范围
         # 设置 x 轴从 0 开始
         # ax.set_xlim(left=0)  # 设置 x 轴的最小值为 0
-        ax.set_ylim(0, self.fukuan)  # 假设 y 轴范围也设置为0-1000，如果需要其他范围可调整此行
+        ax.set_ylim(0, y_hi)
         # 假设坐标是 km；若传入 xmax_override，则上下表面统一取该值
         if xmax_override is not None:
             xmax = float(xmax_override)
@@ -1285,13 +1531,17 @@ class Statistic_anomaly:
         # ---------------------------------------
         current_time = Path(self.result_path).parts[2]  # 文件夹名中的日期
 
-        draw.text((80, 90), f"生产卡号：{self.conduct_id}",
+        draw.text((70, 90), f"质保书号：{self.conduct_id}",
                   fill="black", font=font_main)
 
-        draw.text((300, 90), f"输入幅宽：{self.fukuan} mm",
+        if self.strip_card_no:
+            draw.text((320, 90), f"带钢卡号：{self.strip_card_no}",
+                      fill="black", font=font_main)
+
+        draw.text((560, 90), f"输入幅宽：{self.fukuan} mm",
                   fill="black", font=font_main)
 
-        draw.text((520, 90), f"测量幅宽：{fukuan_min}-{fukuan_max} mm",
+        draw.text((560, 120), f"测量幅宽：{fukuan_min}-{fukuan_max} mm",
                   fill="black", font=font_main)
 
         # 检测区间显示
@@ -1302,8 +1552,8 @@ class Statistic_anomaly:
         else:
             steel_text = "检测区间：全部钢带"
 
-        draw.text((80, 120), steel_text, fill="black", font=font_main)
-        draw.text((400, 120), f"检测时间：{current_time}",
+        draw.text((70, 120), steel_text, fill="black", font=font_main)
+        draw.text((320, 120), f"检测时间：{current_time}",
                   fill="black", font=font_main)
 
         # ---------------------------------------
@@ -1914,8 +2164,27 @@ def _robust_split_1d_four_strips(gray_img, min_strip_width_px=50):
     w2 = max(1, g2 - g1)
     w3 = max(1, g3 - g2)
     ref_w = int(np.median([w2, w3]))
-    l0 = max(0, int(g1 - ref_w * 1.25))
-    r4 = min(w - 1, int(g3 + ref_w * 1.25))
+    # 经验：4条带钢时外推过大更易把左右背景切入；先收紧外推，再用梯度精修外边缘
+    outer_scale = 1.10
+    l0 = max(0, int(g1 - ref_w * outer_scale))
+    r4 = min(w, int(g3 + ref_w * outer_scale))
+
+    # --- 外边缘精修：在预测窗口内用 1D 梯度找真正的“暗->亮 / 亮->暗”边界 ---
+    try:
+        Y = y.astype(np.float32)
+        Y_s = cv2.GaussianBlur(Y.reshape(1, w), (7, 1), 0).flatten()
+        grad = np.gradient(Y_s)
+        win = max(20, int(0.35 * ref_w), w // 30)
+        # 左边缘：在 [l0, l0+win) 找最大正梯度（暗->亮），并向内缩 inset
+        L_new = _refine_outer_edge_1d(grad, l0, min(w, l0 + win), "left", inset_px=6)
+        if L_new is not None:
+            l0 = int(np.clip(L_new, 0, w - 2))
+        # 右边缘：在 [r4-win, r4) 找最小负梯度（亮->暗），返回半开 R
+        R_new = _refine_outer_edge_1d(grad, max(0, r4 - win), r4, "right", inset_px=6)
+        if R_new is not None:
+            r4 = int(np.clip(R_new, l0 + 2, w))
+    except Exception:
+        pass
 
     margin = 10
     splits = [
@@ -2420,6 +2689,69 @@ def _split_3strip_by_gradient(gray_img, fukuan_list_mm, standard_ratio_x=1.0,
 
             out = [(L_new, r0), (l1, r1), (l2, R_new)]
             used_ratio_refine = True
+
+    # ---- 兜底增强：当 Otsu 无法分出 3 段（常见于某一侧黑缝对比度不足被“抬亮”）时，
+    # 改用「谷值(黑缝)」定位：列均值曲线找 2 个最明显谷值，再用导数确定缝宽边界。
+    # 这样能解释你图里的现象：右侧黑缝对比度高 -> Otsu 成功；左侧黑缝浅 -> Otsu 合并失败。
+    if not used_ratio_refine:
+        try:
+            Y = np.mean(roi_gray, axis=0).astype(np.float32)
+            # 轻量去趋势：减去大尺度平滑，突出黑缝“谷”
+            k_bg = max(61, (w // 6) | 1)
+            bg = cv2.GaussianBlur(Y.reshape(1, w), (k_bg, 1), 0).ravel()
+            profile_s = (Y - bg).astype(np.float32)
+            # 再平滑，避免细纹理产生伪谷
+            k_sm = max(31, (w // 80) | 1)
+            profile_s = cv2.GaussianBlur(profile_s.reshape(1, w), (k_sm, 1), 0).ravel()
+
+            valleys = _find_gap_valleys_by_prominence(
+                profile_s,
+                topk=2,
+                min_dist=max(300, w // 6),
+                margin_ratio=0.06,
+                win=max(200, w // 20),
+            )
+            if len(valleys) == 2:
+                v1, v2 = valleys
+                if v1 > v2:
+                    v1, v2 = v2, v1
+
+                d = np.gradient(profile_s).astype(np.float32)
+                d = _smooth_1d(d, k=max(15, (w // 200) | 1)).astype(np.float32)
+                ad = np.abs(d)
+
+                g1L, g1R = _gap_bounds_by_derivative(d, ad, v1, w, q=92, min_th=0.2)
+                g2L, g2R = _gap_bounds_by_derivative(d, ad, v2, w, q=92, min_th=0.2)
+
+                # 外缘用梯度精修：左侧在 [0, g1L) 附近找最强暗->亮；右侧在 (g2R, W] 找亮->暗
+                winL = max(30, w // 25)
+                L_lo = 0
+                L_hi = max(3, min(w, g1L + winL))
+                L_new = _refine_outer_edge_1d(d, L_lo, L_hi, "left", inset_px=4)
+                if L_new is None:
+                    L_new = 0
+
+                winR = max(30, w // 25)
+                R_lo = max(0, g2R - winR)
+                R_hi = w
+                R_new = _refine_outer_edge_1d(d, R_lo, R_hi, "right", inset_px=4)
+                if R_new is None:
+                    R_new = w
+
+                L_new = max(0, int(L_new) - outer_safety_px)
+                R_new = min(w, int(R_new) + outer_safety_px)
+
+                out = [
+                    (L_new, int(g1L)),
+                    (int(g1R), int(g2L)),
+                    (int(g2R), R_new),
+                ]
+
+                # 基本宽度校验，避免极端噪声导致反转
+                if all((R - L) >= min_strip_width_px for (L, R) in out) and out[0][1] <= out[1][0] and out[1][1] <= out[2][0]:
+                    used_ratio_refine = True
+        except Exception:
+            pass
 
     if not used_ratio_refine:
         if len(valid_strips) != num_strips:

@@ -9,7 +9,7 @@
 
 
 import os
-_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 
@@ -756,11 +756,11 @@ class Ui_MainWindow(object):
         _translate = QtCore.QCoreApplication.translate
         MainWindow.setWindowTitle(_translate("MainWindow", "带钢表面缺陷检测系统"))
         self.label_ID_7.setText(_translate("MainWindow", "类别"))
-        self.label_ID_6.setText(_translate("MainWindow", "幅宽"))
+        self.label_ID_6.setText(_translate("MainWindow", "幅宽及卡号"))
         self.para_config01.setText(_translate("MainWindow", "确认"))
         self.button_exchange.setText(_translate("MainWindow", "换卷"))
-        self.label_ID.setText(_translate("MainWindow", "带钢产品号"))
-        self.groupBox_2.setTitle(_translate("MainWindow", "运行状态"))
+        self.label_ID.setText(_translate("MainWindow", "质保书号"))
+        self.groupBox_2.setTitle(_translate("MainWindow", "系统状态"))
         self.run_state.setText(_translate("MainWindow", "暂停"))
         self.label_width_3.setText(_translate("MainWindow", "报警开关"))
         self.pushButton_old_report.setText(_translate("MainWindow", "报告打印"))

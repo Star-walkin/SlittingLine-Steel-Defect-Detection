@@ -31,7 +31,7 @@ import sys
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from app.common.function_bank import split_multi_strips as fb_split_multi_strips
+from function_bank import split_multi_strips as fb_split_multi_strips
 from det_model.prepare_dataset_det import preprocess_like_inference, list_images
 
 

@@ -19,7 +19,7 @@ from configui import Ui_Parameter  # 引用生成的 ui_para.py 文件
 import yaml
 import sys
 import os
-_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 import ast
 
 

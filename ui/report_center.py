@@ -24,11 +24,22 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtWidgets import QInputDialog, QLineEdit
 from report_change import ReportWindow
 import sys
+from cls_config import ClsConfigWindow
+from cls_model_registry import compat_and_remap as _cls_compat_and_remap, rptcfg_class_names as _rptcfg_class_names
 
 
 _PROJECT_ROOT = os.path.join(_REPO_ROOT)
 _AUTH_CONFIG_PATH = os.path.join(_PROJECT_ROOT, "config", "auth.yaml")
 _DETECT_ROOT = os.path.join(_PROJECT_ROOT, "detect result")
+
+
+def _read_auth_password(role: str) -> str:
+    try:
+        with open(_AUTH_CONFIG_PATH, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        return str(cfg.get("passwords", {}).get(role, "000"))
+    except Exception:
+        return "000"
 _RPTCFG_PATH = os.path.join(_PROJECT_ROOT, "config", "rptcfg.yaml")
 _CONFIG0_PATH = os.path.join(_PROJECT_ROOT, "config", "config0.yaml")
 _PYTHON_EXE = os.environ.get('STEEL_PYTHON_EXE', sys.executable)
@@ -75,7 +86,7 @@ class ResultSelection:
 
 class ReportCenterWindow(QtWidgets.QMainWindow):
     """
-    报告中心：选择现有检测结果（日期/卡号/带钢）并生成/查看/修改报告。
+    报告中心：选择现有检测结果（日期/质保书号/带钢）并生成/查看/修改报告。
     """
 
     def __init__(self) -> None:
@@ -104,18 +115,24 @@ class ReportCenterWindow(QtWidgets.QMainWindow):
         self.comboDate.setMinimumWidth(140)
         row.addWidget(self.comboDate)
 
-        row.addWidget(QLabel("卡号"))
+        row.addWidget(QLabel("质保书号"))
         self.comboConductId = QComboBox()
         self.comboConductId.setMinimumWidth(220)
         row.addWidget(self.comboConductId)
 
-        row.addWidget(QLabel("钢带号"))
+        row.addWidget(QLabel("带钢卡号"))
         self.comboStripId = QComboBox()
-        self.comboStripId.setMinimumWidth(100)
+        self.comboStripId.setMinimumWidth(160)
         row.addWidget(self.comboStripId)
 
         self.btnRefresh = QPushButton("刷新")
         row.addWidget(self.btnRefresh)
+        self.btnTypeConfig = QPushButton("类型配置")
+        self.btnTypeConfig.setToolTip(
+            "打开“类别配置”窗口（需密码，见 config/auth.yaml 的 cls_config）。"
+            "维护型号、允收矩阵、并为每个型号选择分类模型。"
+        )
+        row.addWidget(self.btnTypeConfig)
         row.addStretch(1)
 
         # ---- actions row
@@ -131,6 +148,10 @@ class ReportCenterWindow(QtWidgets.QMainWindow):
         row2.addWidget(self.btnView)
         row2.addWidget(self.btnModify)
         row2.addWidget(self.btnOpenFolder)
+        # 分类模型状态：生成报告前必须合格
+        self.lblClsStatus = QLabel("")
+        self.lblClsStatus.setStyleSheet("color:#555;")
+        row2.addWidget(self.lblClsStatus)
         row2.addStretch(1)
 
         # ---- progress + log
@@ -147,6 +168,7 @@ class ReportCenterWindow(QtWidgets.QMainWindow):
 
         # ---- wiring
         self.btnRefresh.clicked.connect(self.refresh_lists)
+        self.btnTypeConfig.clicked.connect(self.open_type_config)
         self.comboDate.currentIndexChanged.connect(self._on_date_changed)
         self.comboConductId.currentIndexChanged.connect(self._on_conduct_changed)
 
@@ -156,6 +178,7 @@ class ReportCenterWindow(QtWidgets.QMainWindow):
         self.btnModify.clicked.connect(self.open_modify)
 
         self.refresh_lists()
+        self._refresh_cls_status()
 
     # -------------------- progress smoothing --------------------
     def _set_progress_target(self, v: float) -> None:
@@ -201,6 +224,7 @@ class ReportCenterWindow(QtWidgets.QMainWindow):
             self.comboDate.blockSignals(False)
             self.comboConductId.blockSignals(False)
             self.comboStripId.blockSignals(False)
+        self._refresh_cls_status()
 
     def _on_date_changed(self) -> None:
         date = self.comboDate.currentText().strip()
@@ -256,22 +280,70 @@ class ReportCenterWindow(QtWidgets.QMainWindow):
         # initial selection: strip 1; later refreshed by inference
         tmp_sel = ResultSelection(date=date, conduct_id=cid, strip_id_1based=1)
         strip_ids = self._infer_strip_ids(tmp_sel)
-        self.comboStripId.addItems([str(i) for i in strip_ids])
+        # 优先读取该卷根目录 config0_snapshot.yaml；其次读 report/strip_N/config0_snapshot.yaml；最后回退编号
+        strip_card_map = {}
+        try:
+            root_snap = os.path.join(tmp_sel.result_all_path, "config0_snapshot.yaml")
+            cfg0_root = None
+            if os.path.exists(root_snap):
+                with open(root_snap, "r", encoding="utf-8") as f:
+                    cfg0_root = yaml.safe_load(f) or {}
+
+            for sid in strip_ids:
+                val = ""
+                if isinstance(cfg0_root, dict):
+                    cards = cfg0_root.get("strip_card_list") or []
+                    if isinstance(cards, (list, tuple)) and len(cards) >= sid:
+                        val = str(cards[sid - 1] or "").strip()
+                    if not val:
+                        val = str(cfg0_root.get(f"strip_card_{sid}", "") or "").strip()
+
+                if not val:
+                    snap = os.path.join(tmp_sel.result_all_path, "report", f"strip_{sid}", "config0_snapshot.yaml")
+                    if os.path.exists(snap):
+                        with open(snap, "r", encoding="utf-8") as f:
+                            cfg0 = yaml.safe_load(f) or {}
+                        cards = cfg0.get("strip_card_list") or []
+                        if isinstance(cards, (list, tuple)) and len(cards) >= sid:
+                            val = str(cards[sid - 1] or "").strip()
+                        else:
+                            val = str(cfg0.get(f"strip_card_{sid}", "") or "").strip()
+
+                if val:
+                    strip_card_map[int(sid)] = val
+        except Exception:
+            strip_card_map = {}
+
+        for sid in strip_ids:
+            card = strip_card_map.get(int(sid))
+            # 甲方口径：优先直接显示工人输入的“带钢卡号”；内部 data 仍保存 strip_id 数字
+            label = str(card) if card else str(sid)
+            self.comboStripId.addItem(label, int(sid))
+            try:
+                tip = f"带钢号：{sid}" if card else f"带钢号：{sid}"
+                self.comboStripId.setItemData(self.comboStripId.count() - 1, tip, QtCore.Qt.ToolTipRole)
+            except Exception:
+                pass
 
     # -------------------- selection helpers --------------------
     def _get_selection(self) -> Optional[ResultSelection]:
         date = self.comboDate.currentText().strip()
         cid = self.comboConductId.currentText().strip()
-        strip_s = self.comboStripId.currentText().strip()
-        if not date or not cid or not strip_s:
-            QMessageBox.information(self, "选择不完整", "请先选择日期、卡号与钢带号。")
+        if self.comboStripId.currentIndex() < 0:
+            strip_s = ""
+            strip_id = None
+        else:
+            strip_id = self.comboStripId.currentData()
+            strip_s = self.comboStripId.currentText().strip()
+        if not date or not cid or not strip_s or strip_id is None:
+            QMessageBox.information(self, "选择不完整", "请先选择日期、质保书号与带钢卡号。")
             return None
         try:
-            strip_id = int(strip_s)
+            strip_id = int(strip_id)
             if strip_id < 1:
                 raise ValueError
         except Exception:
-            QMessageBox.warning(self, "钢带号错误", f"钢带号必须为>=1整数，当前：{strip_s}")
+            QMessageBox.warning(self, "带钢号错误", f"带钢号必须为>=1整数，当前：{strip_s}")
             return None
 
         sel = ResultSelection(date=date, conduct_id=cid, strip_id_1based=strip_id)
@@ -285,6 +357,29 @@ class ReportCenterWindow(QtWidgets.QMainWindow):
         sel = self._get_selection()
         if not sel:
             return
+
+        # 生成报告（update-info=false）会触发分类推理：必须保证分类模型“已配置+有classes.json+与当前标准兼容”
+        if not self._check_cls_model_ready(force_open=True):
+            return
+
+        # 生成前轻量自检：提示最常见的“类别名/颜色表不一致”风险（不阻断生成）
+        try:
+            with open(_RPTCFG_PATH, "r", encoding="utf-8") as f:
+                rptcfg = yaml.safe_load(f) or {}
+            cls_labels = rptcfg.get("class_labels") or {}
+            colors = rptcfg.get("colors") or {}
+            missing = []
+            for _k, _name in cls_labels.items():
+                if _name and _name not in colors:
+                    missing.append(str(_name))
+            if missing:
+                self._append_log(
+                    "[WARN] colors 缺少以下类别颜色，生成时将自动回退默认色："
+                    + "、".join(missing[:10])
+                    + ("\n" if len(missing) <= 10 else f"...（共{len(missing)}项）\n")
+                )
+        except Exception:
+            pass
 
         self._ensure_process_stopped()
         self.txtLog.clear()
@@ -315,6 +410,113 @@ class ReportCenterWindow(QtWidgets.QMainWindow):
         proc.start(_PYTHON_EXE, args)
         self._process = proc
         self._set_progress_target(6)
+
+    def open_type_config(self) -> None:
+        password, ok = QInputDialog.getText(
+            self,
+            "密码验证",
+            "进入类别配置需要权限验证，请输入密码:",
+            QLineEdit.Password,
+        )
+        if not ok:
+            return
+        if password != _read_auth_password("cls_config"):
+            QMessageBox.warning(self, "密码错误", "请输入正确的密码！")
+            return
+        if not hasattr(self, "_type_cfg_win") or self._type_cfg_win is None:
+            self._type_cfg_win = ClsConfigWindow(self)
+        self._type_cfg_win.show()
+        self._type_cfg_win.raise_()
+        self._type_cfg_win.activateWindow()
+
+    def _refresh_cls_status(self) -> None:
+        ok, msg = self._check_cls_model_ready(force_open=False, silent=True, return_message=True)
+        if ok:
+            self.lblClsStatus.setStyleSheet("color:#2e7d32; font-weight:bold;")
+            self.lblClsStatus.setText(f"分类模型：已就绪（{msg}）")
+        else:
+            self.lblClsStatus.setStyleSheet("color:#c62828; font-weight:bold;")
+            self.lblClsStatus.setText(f"分类模型：未就绪（{msg}）")
+
+    def _check_cls_model_ready(
+        self,
+        *,
+        force_open: bool,
+        silent: bool = False,
+        return_message: bool = False,
+    ):
+        # 读取 cls_model_path
+        try:
+            with open(os.path.join(_PROJECT_ROOT, "config", "config.yaml"), "r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+        except Exception:
+            cfg = {}
+        model_path = str((cfg or {}).get("cls_model_path", "") or "").strip()
+        if not model_path:
+            if not silent:
+                QMessageBox.warning(self, "分类模型未配置", "当前未配置分类模型（cls_model_path 为空）。")
+            if force_open:
+                self._force_open_model_picker()
+            return (False, "未配置") if return_message else False
+        if not os.path.exists(model_path):
+            if not silent:
+                QMessageBox.warning(self, "分类模型不存在", f"分类模型文件不存在：\n{model_path}")
+            if force_open:
+                self._force_open_model_picker()
+            return (False, "文件不存在") if return_message else False
+
+        # classes.json 必须存在（否则无法确认类别对应关系）
+        cj = os.path.join(os.path.dirname(model_path), "classes.json")
+        model_classes = []
+        if os.path.exists(cj):
+            try:
+                import json
+
+                with open(cj, "r", encoding="utf-8") as f:
+                    obj = json.load(f) or {}
+                if isinstance(obj, dict) and "id_to_name" in obj and isinstance(obj["id_to_name"], dict):
+                    obj = obj["id_to_name"]
+                if isinstance(obj, dict):
+                    for kk in sorted(obj.keys(), key=lambda x: int(str(x))):
+                        model_classes.append(str(obj.get(kk, "")).strip())
+            except Exception:
+                model_classes = []
+
+        if not model_classes:
+            if not silent:
+                QMessageBox.warning(
+                    self,
+                    "分类模型不完整",
+                    "当前模型缺少类别清单（classes.json）。为避免分类错位，禁止生成报告。\n\n"
+                    "请进入「报告打印与标准维护」选择可用模型，或通过向导重新训练并启用。",
+                )
+            if force_open:
+                self._force_open_model_picker()
+            return (False, "缺少classes.json") if return_message else False
+
+        rpt_names = _rptcfg_class_names(_RPTCFG_PATH)
+        ok, remap, diff = _cls_compat_and_remap(model_classes=model_classes, rptcfg_classes=rpt_names)
+        if not ok:
+            if not silent:
+                QMessageBox.warning(
+                    self,
+                    "分类模型与标准不一致",
+                    "当前分类模型的类别与缺陷类别标准不一致，禁止生成报告。\n\n"
+                    f"缺少：{', '.join(diff.get('missing') or []) or '-'}\n"
+                    f"多出：{', '.join(diff.get('extra') or []) or '-'}\n\n"
+                    "请进入「报告打印与标准维护」选择类别一致的模型，或重新训练。",
+                )
+            if force_open:
+                self._force_open_model_picker()
+            return (False, "类别不一致") if return_message else False
+
+        # ok
+        same_order = remap == list(range(1, len(remap) + 1))
+        return (True, "顺序一致" if same_order else "已自动对齐") if return_message else True
+
+    def _force_open_model_picker(self) -> None:
+        # 按你的要求：模型选择只在“类别配置”区域可用
+        self.open_type_config()
 
     def view_report(self) -> None:
         sel = self._get_selection()

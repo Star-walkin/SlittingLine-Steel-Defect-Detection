@@ -1,5 +1,5 @@
 import os
-_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 
 import pandas as pd
 import yaml
@@ -14,7 +14,12 @@ with open(_RPTCFG_PATH, "r", encoding="utf-8") as f:
     rptcfg = yaml.safe_load(f) or {}
 
 product_cls = str(rptcfg.get("product_cls", "1"))
-class_labels = rptcfg.get("class_labels", {})  # {id:int -> name:str}
+# class_labels: 优先按型号取覆盖（class_labels_by_product），否则回退全局
+_by = rptcfg.get("class_labels_by_product")
+if isinstance(_by, dict) and str(product_cls) in _by and isinstance(_by.get(str(product_cls)), dict):
+    class_labels = _by.get(str(product_cls), {})  # type: ignore[assignment]
+else:
+    class_labels = rptcfg.get("class_labels", {})  # {id:int -> name:str}
 class_list = rptcfg.get("class_list", [])      # [id,...]
 data = rptcfg.get(f"data{product_cls}", [])
 

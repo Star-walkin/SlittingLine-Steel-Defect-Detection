@@ -1,10 +1,20 @@
-conduct_id: '14'
-fukuan_1: 500.0
-fukuan_2: 500.0
-fukuan_3: 0.0
+conduct_id: '19998'
+confirmed_at: '2026-04-06 12:03:06'
+fukuan_1: 516.0
+fukuan_2: 491.0
+fukuan_3: 494.0
 fukuan_4: 0.0
 fukuan_list:
-- 500.0
-- 500.0
-product_cls: '1'
-strip_count: 2
+- 516.0
+- 491.0
+- 494.0
+product_cls: '4'
+strip_card_1: '1734'
+strip_card_2: '1733'
+strip_card_3: '1732'
+strip_card_4: ''
+strip_card_list:
+- '1734'
+- '1733'
+- '1732'
+strip_count: 3

@@ -1,6 +1,6 @@
 """
 det_model/infer.py
-本目录在 PatchCore-only 版本中仅用于复用“线上一致”的预处理函数。
+SlidingWindowDetector - 在原始分辨率下使用滑动窗口推理，避免缩放损失缺陷信号。
 """
 
 import os
@@ -16,7 +16,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from app.common.function_bank import test_one_image, mean_smoothing
+from function_bank import test_one_image, mean_smoothing
 
 # 与训练数据预处理一致：FFT 去纹（img_select 相同逻辑），削弱横向条纹
 MASK_WIDTH_FFT = 10
@@ -24,7 +24,7 @@ CENTER_PROTECT_FFT = 15
 
 
 def apply_fft_deripple(gray: np.ndarray) -> np.ndarray:
-    """对灰度图做 FFT 去纹（用于与线上推理一致的预处理）。"""
+    """对灰度图做 FFT 去纹（PatchCore/预处理链路可复用）。"""
     rows, cols = gray.shape
     dft = cv2.dft(np.float32(gray), flags=cv2.DFT_COMPLEX_OUTPUT)
     dft_shift = np.fft.fftshift(dft)

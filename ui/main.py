@@ -1,8 +1,16 @@
 from PyQt5 import QtWidgets, QtCore
 from PyQt5.QtWidgets import QInputDialog, QMessageBox, QLineEdit, QComboBox
-from PyQt5.QtGui import QPixmap, QPainter, QPen, QFont
+from PyQt5.QtGui import QPixmap, QPainter, QPen, QFont, QFontMetrics
 from PyQt5.QtCore import QRect, Qt, QTimer, QThread, pyqtSignal, QProcess
-from PyQt5.QtWidgets import QApplication, QWidget, QLabel, QPushButton, QHBoxLayout, QVBoxLayout
+from PyQt5.QtWidgets import (
+    QApplication,
+    QWidget,
+    QLabel,
+    QPushButton,
+    QHBoxLayout,
+    QVBoxLayout,
+    QSizePolicy,
+)
 from mainui import Ui_MainWindow  # 导入pyuic生成的类
 from para import ParaWindow
 from report_change import ReportWindow
@@ -12,12 +20,14 @@ from cls_config import (
     product_combo_entries,
     product_cls_key_from_combo_text,
 )
+from cls_train_window import ClsTrainWindow
+from cls_wizard import ClsWizardWindow
 import sys
 import os
-# ui/ 位于仓库根下一层
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 import time
 import subprocess
+import json
 import json
 import serial
 import yaml
@@ -26,6 +36,25 @@ import math
 from datetime import timedelta, datetime
 
 _AUTH_CONFIG_PATH = os.path.join(_REPO_ROOT, "config", "auth.yaml")
+_RUNTIME_STATE_PATH = os.path.join(_REPO_ROOT, "config", "runtime_state.json")
+_LINE_HEARTBEAT_PATH = os.path.join(_REPO_ROOT, "config", "line_heartbeat.json")
+
+
+def _write_runtime_state(paused: bool) -> None:
+    """
+    运行态控制：给 detect_anomalies_online.py 一个“暂停/继续”开关。
+    paused=True  -> 暂停（不杀进程、不关 socket，接收端按暂停策略处理）
+    paused=False -> 继续
+    """
+    try:
+        os.makedirs(os.path.dirname(_RUNTIME_STATE_PATH), exist_ok=True)
+        tmp = _RUNTIME_STATE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"paused": bool(paused)}, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, _RUNTIME_STATE_PATH)
+    except Exception:
+        # 控制文件写失败不应导致 UI 崩溃
+        pass
 
 
 def _read_auth_password(role: str) -> str:
@@ -36,6 +65,53 @@ def _read_auth_password(role: str) -> str:
         return str(cfg.get("passwords", {}).get(role, "000"))
     except Exception:
         return "000"
+
+
+def _read_line_heartbeat_ts() -> float:
+    try:
+        with open(_LINE_HEARTBEAT_PATH, "r", encoding="utf-8") as f:
+            d = json.load(f) or {}
+        return float(d.get("ts", 0.0) or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _defect_length_mm_to_px(y_mm, start_mm, end_mm, x_max_px, ui):
+    """
+    缺陷分布 / 幅宽曲线共用：物理长度 y(mm) 映射到横轴像素。
+    ui 含 nonlinear、tail_phys_ratio、tail_pixel_ratio（见 _read_ui_defect_display_config）。
+    """
+    try:
+        L = float(end_mm) - float(start_mm)
+    except (TypeError, ValueError):
+        return 0.0
+    if L <= 1e-9:
+        return 0.0
+    try:
+        y = float(y_mm)
+    except (TypeError, ValueError):
+        return 0.0
+    sm, em = float(start_mm), float(end_mm)
+    y = max(sm, min(em, y))
+    xm = max(1.0, float(x_max_px))
+    use_nl = bool(ui.get("nonlinear"))
+    tpr = float(ui.get("tail_pixel_ratio", 0.2) or 0)
+    tph = float(ui.get("tail_phys_ratio", 0.35) or 0)
+    if not use_nl or tpr <= 1e-6 or tpr >= 1.0 - 1e-6 or tph <= 1e-9:
+        return (y - sm) / L * xm
+    tail_phys_ratio = min(0.99, max(1e-6, tph))
+    tail_phys = L * tail_phys_ratio
+    split_mm = em - tail_phys
+    if split_mm <= sm + 1e-6:
+        return (y - sm) / L * xm
+    px_left = xm * (1.0 - tpr)
+    px_right = xm * tpr
+    if y <= split_mm:
+        denom = max(split_mm - sm, 1e-9)
+        return (y - sm) / denom * px_left
+    denom = max(em - split_mm, 1e-9)
+    return px_left + (y - split_mm) / denom * px_right
+
 
 # ---------- 幅宽偏窄判定（工程容差，整体偏宽松）----------
 # 「显著偏窄」下阈值 = 设定幅宽 − max(绝对容差mm, 设定×相对比例)，仅当实测低于该阈值才计入预警/报警统计。
@@ -271,9 +347,21 @@ class ImageLoaderThread(QThread):
         self.fukuan_fallback = 0.0
 
     def run(self):
+        poll_ms = 500
+        try:
+            with open(
+                os.path.join(_REPO_ROOT, "config", "config.yaml"),
+                "r",
+                encoding="utf-8",
+            ) as f:
+                _cfg = yaml.safe_load(f) or {}
+            poll_ms = int(_cfg.get("ui_defect_coord_poll_ms", 500) or 500)
+        except Exception:
+            pass
+        poll_ms = max(100, min(poll_ms, 5000))
         self.timer = QTimer()
         self.timer.timeout.connect(self.read_coordinates)
-        self.timer.start(2000)
+        self.timer.start(poll_ms)
         self.exec_()
 
     def find_folders_with_id(self, base_path, product_id):
@@ -401,10 +489,17 @@ class ImageLoaderThread(QThread):
                 self.last_file_path = coord_file_path
                 self.last_mtime = current_mtime
 
-            # 发送数据逻辑
+            # 发送数据逻辑（积压多时单次多推，减轻「窗口已滑过才入队」）
             remaining = len(self.all_coordinates) - self.position
             if remaining > 0:
-                read_count = min(10, remaining)
+                if remaining > 500:
+                    read_count = min(50, remaining)
+                elif remaining > 200:
+                    read_count = min(25, remaining)
+                elif remaining > 80:
+                    read_count = min(15, remaining)
+                else:
+                    read_count = min(10, remaining)
                 for i in range(read_count):
                     if self.position < len(self.all_coordinates):
                         x, y = self.all_coordinates[self.position]
@@ -459,6 +554,10 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.wave_window_end_mm = [1720.0 for _ in range(self.MAX_STRIPS)]
         self.csharp_process = None
         self.python_process = None
+        # 本次打开主界面的“确认”标记：必须本次点过确认，才允许开始/暂停
+        self._confirmed_this_session = False
+        # 与右上角检测状态一致：True=运行中（未暂停），换卷前须为 False
+        self._ui_detection_running = False
         self.loader_thread =  [None for _ in range(self.MAX_STRIPS)]
         self.loader_thread2 =  [None for _ in range(self.MAX_STRIPS)]
         self.total_data = [[] for _ in range(self.MAX_STRIPS)]
@@ -492,13 +591,11 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             self.pushButton_old_report.setEnabled(False)
         except Exception:
             pass
-        # 拉长「运行状态」框以填补空白
+        # 右上角：产线状态 + 检测状态（统一布局，表达清晰）
         try:
-            from PyQt5.QtCore import QRect
-            self.groupBox_2.setGeometry(QRect(600, 0, 151, 111))
-            self.run_state.setGeometry(QRect(20, 45, 111, 41))
+            self._layout_status_panel()
         except Exception:
-            pass
+            self.line_state = None
         self.pushButton_report.clicked.connect(self.pushButton_report_click)
         self.pushButton.clicked.connect(self.baojing_close)
         self.button_exchange.clicked.connect(self.exchangeNEWONE)
@@ -506,11 +603,21 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.para_window = None#声明窗口实例变量，初始化为 None 表示窗口尚未创建
         self.report_window = None
         self.report_center_window = None
+        # 初始：未确认配置时不允许开始/暂停
+        try:
+            self._refresh_start_stop_enabled()
+        except Exception:
+            pass
 
         self.render_timer = QTimer(self)
         self.render_timer.timeout.connect(self.update_all_plots)
         # 约 30 FPS，配合浮点插值游标，滑动更顺滑
         self.render_timer.start(33)
+
+        # 产线状态刷新（低频）
+        self._line_state_timer = QTimer(self)
+        self._line_state_timer.timeout.connect(self._refresh_line_state)
+        self._line_state_timer.start(500)
         self._create_strip4_controls()
         self._init_strip_count_ui()
         self._init_scrollable_strip_layout()
@@ -695,12 +802,15 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         标签列与输入列纵向分组，标签在首行、输入在次行，同列水平居中对齐。
         """
         _R = QRect
-        # 配置区宽度与高度（加高以容纳两行 + 留白）
-        fw, fh = 971, 118
+        # 配置区宽度与高度（四行：标签行 / 输入行 / 带钢卡号行 / 功能按钮行）
+        fw, fh = 971, 168
         self.frame.setGeometry(QtCore.QRect(self.frame.x(), self.frame.y(), fw, fh))
 
         row1_y, row1_h = 6, 28
         row2_y, row2_h = 40, 38
+        # 与幅宽输入框同高，确保视觉一致
+        row3_y, row3_h = 82, 38
+        row4_y, row4_h = 124, 30
 
         conduct_x, conduct_w = 10, 190
         gap_after_conduct = 10
@@ -716,20 +826,34 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         exch_x = combo_x + combo_w + 10
         exch_w = 82
 
-        # 带钢产品号：标签与输入框同一列中心对齐
+        # 质保书号：标签与输入框同一列中心对齐
         self.label_ID.setGeometry(_R(conduct_x, row1_y, conduct_w, row1_h))
         self.label_ID.setAlignment(Qt.AlignLeft | Qt.AlignBottom)
         self.conduct_id.setGeometry(_R(conduct_x, row2_y, conduct_w, row2_h))
 
-        # 幅宽：标签与第1个幅宽输入左对齐
-        self.label_ID_6.setGeometry(_R(fukuan_x0, row1_y, 80, row1_h))
+        # 幅宽：主标签与右侧说明「由西向东…」分列，避免与首列幅宽输入重叠
+        self.label_ID_6.setGeometry(_R(fukuan_x0, row1_y, 76, row1_h))
         self.label_ID_6.setAlignment(Qt.AlignLeft | Qt.AlignBottom)
+        if hasattr(self, "label_fukuan_order_hint"):
+            hint_x = fukuan_x0 + 78
+            hint_w = max(120, min(280, combo_x - hint_x - 6))
+            self.label_fukuan_order_hint.setGeometry(_R(hint_x, row1_y, hint_w, row1_h))
+            self.label_fukuan_order_hint.setAlignment(Qt.AlignLeft | Qt.AlignBottom)
 
         fx = fukuan_x0
         for i, w in enumerate(
             (self.fukuan_1, self.fukuan_2, self.fukuan_3, self.fukuan_4), start=1
         ):
             w.setGeometry(_R(fx, row2_y, fukuan_w, row2_h))
+            fx += fukuan_w + fukuan_gap
+
+        # 带钢卡号：放在对应幅宽正下方，一一对应
+        if hasattr(self, "label_strip_card"):
+            self.label_strip_card.setGeometry(_R(fukuan_x0, row3_y, 80, row3_h))
+            self.label_strip_card.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        fx = fukuan_x0
+        for w in getattr(self, "strip_card_edits", []):
+            w.setGeometry(_R(fx, row3_y, fukuan_w, row3_h))
             fx += fukuan_w + fukuan_gap
 
         # 带钢条数：标签与下拉同一行（首行），不占用第二行
@@ -743,12 +867,31 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.label_ID_7.setAlignment(Qt.AlignLeft | Qt.AlignBottom)
         self.product_cls_combo.setGeometry(_R(combo_x, row2_y, combo_w, row2_h))
 
-        # 「类别配置」紧跟在「产品型号」标签右侧，避免幅宽加宽后与标签重叠
-        btn_cls_w = 100
-        label_pw_right = combo_x + lbl_pw_w
-        btn_cls_x = min(label_pw_right + 8, 878 - btn_cls_w - 6)
-        self.btn_cls_config.setGeometry(_R(btn_cls_x, row1_y, btn_cls_w, 30))
+        # 第四行（row4）：三个分类入口按钮，独占一行，与产品型号下拉左对齐
+        # 与 row2/row3 错开，彻底消除与输入区重叠
+        b3_x = combo_x        # 与「产品型号」下拉框左边缘对齐
+        btn_gap3 = 8
+
+        # 1. 缺陷分类向导（小白主入口，最显眼）
+        if hasattr(self, "btn_cls_wizard"):
+            wiz_w = 124
+            self.btn_cls_wizard.setGeometry(_R(b3_x, row4_y, wiz_w, row4_h))
+            b3_x += wiz_w + btn_gap3
+
+        # 2. 类别配置（专业入口）
+        if hasattr(self, "btn_cls_config"):
+            cfg_w = 88
+            self.btn_cls_config.setGeometry(_R(b3_x, row4_y, cfg_w, row4_h))
+            b3_x += cfg_w + btn_gap3
+
+        # 3. 分类训练（专业入口）
+        if hasattr(self, "btn_cls_train"):
+            tr_w = 88
+            self.btn_cls_train.setGeometry(_R(b3_x, row4_y, tr_w, row4_h))
+
+        # 参数设置（确认）保持在右上角 row1
         self.para_config01.setGeometry(_R(878, row1_y, 75, 30))
+        # 切换按钮保持在 row2 右侧，不受 row3 影响
         self.button_exchange.setGeometry(_R(exch_x, row2_y, exch_w, row2_h))
 
         # 下方条带滚动区随配置区高度下移，避免被遮挡
@@ -765,13 +908,25 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.fukuan_1.setPlaceholderText("幅宽1(mm)")
         self.fukuan_2.setPlaceholderText("幅宽2(mm)")
         self.fukuan_3.setPlaceholderText("幅宽3(mm)")
-        # 左上角：固定文字「带钢产品号」为 QLabel，输入在下一行，避免被误认为整格都是输入框
-        self.label_ID.setText("带钢产品号")
+        try:
+            self.label_ID_6.setText("幅宽及卡号")
+            self.label_ID_6.setToolTip("请在下方填写各条带钢的幅宽与对应带钢卡号（与条数一一对应）。")
+            self.label_fukuan_order_hint = QLabel("（由西向东顺序依次输入）", self.frame)
+            self.label_fukuan_order_hint.setStyleSheet(
+                "QLabel { color: #5a5a5a; font: 12px 'Arial'; background: transparent; border: none; }"
+            )
+            self.label_fukuan_order_hint.setToolTip(
+                "幅宽1、幅宽2…与带钢卡号1、2…按产线由西向东的顺序一一对应填写。"
+            )
+        except Exception:
+            pass
+        # 左上角：固定文字「质保书号」为 QLabel，输入在下一行，避免被误认为整格都是输入框
+        self.label_ID.setText("质保书号")
         self.label_ID.setStyleSheet(
             "QLabel { background: transparent; color: #1a1a1a; border: none; }"
         )
-        self.label_ID.setToolTip("固定说明文字；请在下方输入框填写带钢产品号（生产卡号）。")
-        self.conduct_id.setPlaceholderText("请输入带钢产品号")
+        self.label_ID.setToolTip("固定说明文字；请在下方输入框填写质保书号。")
+        self.conduct_id.setPlaceholderText("请输入质保书号")
 
         # 隐藏 mainui 生成的 QLineEdit（保留对象避免潜在引用报错）
         self.product_cls.hide()
@@ -806,16 +961,55 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             "QPushButton:hover { background-color: #C8E6C9; }"
         )
         self.btn_cls_config.setToolTip(
-            "打开类别配置窗口。\n"
+            "打开类别配置窗口（需密码，见 config/auth.yaml 的 cls_config）。\n"
             "在此维护产品型号（data{N}）、缺陷类别名称和允收矩阵，\n"
             "保存后可生成 table.json 供报告判定使用。"
         )
         self.btn_cls_config.clicked.connect(self._open_cls_config)
         self._cls_config_window = None
 
+        self.btn_cls_train = QPushButton("分类训练", self.frame)
+        self.btn_cls_train.setFont(font_btn)
+        self.btn_cls_train.setStyleSheet(
+            "QPushButton { background-color: #E3F2FD; color: #1565C0;"
+            " border: 1px solid #90CAF9; border-radius: 4px;"
+            " padding-left: 14px; padding-right: 12px; }"
+            "QPushButton:hover { background-color: #BBDEFB; }"
+        )
+        self.btn_cls_train.setToolTip(
+            "打开分类训练与模型管理。\n"
+            "可配置训练集（按类别文件夹）、后台一键训练并启用分类模型。"
+        )
+        self.btn_cls_train.clicked.connect(self._open_cls_train)
+        self._cls_train_window = None
+
+        self.btn_cls_wizard = QPushButton("缺陷分类向导", self.frame)
+        self.btn_cls_wizard.setFont(font_btn)
+        self.btn_cls_wizard.setStyleSheet(
+            "QPushButton { background-color: #FFF3E0; color: #E65100;"
+            " border: 1px solid #FFCC80; border-radius: 4px;"
+            " padding-left: 14px; padding-right: 12px; }"
+            "QPushButton:hover { background-color: #FFE0B2; }"
+        )
+        self.btn_cls_wizard.setToolTip("推荐：工人小白模式，一步一步完成缺陷类型配置与训练准备。")
+        self.btn_cls_wizard.clicked.connect(self._open_cls_wizard)
+        self._cls_wizard_window = None
+
         self.fukuan_4 = QLineEdit(self.frame)
         self.fukuan_4.setFont(input_font)
         self.fukuan_4.setPlaceholderText("幅宽4(mm)")
+
+        # 带钢卡号：每条带钢对应一个名称输入（位于幅宽正下方）
+        self.label_strip_card = QLabel("带钢卡号(对应幅宽)", self.frame)
+        self.label_strip_card.setStyleSheet("font: 14px 'Arial'; font-weight: bold;")
+        self.label_strip_card.setToolTip("请输入每条带钢对应的名称（带钢卡号），并与上方幅宽一一对应。")
+        self.strip_card_edits = []
+        for i in range(1, 5):
+            ed = QLineEdit(self.frame)
+            ed.setFont(QFont("Arial", 14))
+            ed.setPlaceholderText(f"带钢卡号{i}")
+            ed.setToolTip("该条带钢名称/带钢卡号（将用于主界面显示与报告显示）。")
+            self.strip_card_edits.append(ed)
 
         self.strip_count_label = QLabel("带钢条数", self.frame)
         self.strip_count_label.setStyleSheet("font: 16px 'Arial'; font-weight: bold;")
@@ -828,6 +1022,11 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
 
         # 统一几何布局（解决幅宽4与产品型号重叠）
         self._layout_production_config_strip()
+        # 初次加载时按条数隐藏多余的“带钢卡号”输入
+        try:
+            self.apply_strip_layout(self.system_count)
+        except Exception:
+            pass
 
     def _current_product_cls_key_from_combo(self) -> str:
         """当前选中的型号编号（与 data{N}、config0 一致）。"""
@@ -882,6 +1081,17 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
 
     def _open_cls_config(self):
         """打开类别配置窗口，关闭后刚新型号列表。"""
+        password, ok = QInputDialog.getText(
+            self,
+            "密码验证",
+            "进入类别配置需要权限验证，请输入密码:",
+            QLineEdit.Password,
+        )
+        if not ok:
+            return
+        if password != _read_auth_password("cls_config"):
+            QMessageBox.warning(self, "密码错误", "请输入正确的密码！", QMessageBox.Ok)
+            return
         if self._cls_config_window is None or not self._cls_config_window.isVisible():
             self._cls_config_window = ClsConfigWindow(self)
             self._cls_config_window.finished.connect(self._on_cls_config_closed)
@@ -892,6 +1102,46 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
     def _on_cls_config_closed(self):
         """类别配置窗口关闭时刷新型号下拉列表。"""
         self._refresh_product_cls_combo()
+
+    def _is_detect_running(self) -> bool:
+        try:
+            return (
+                getattr(self, "python_process", None) is not None
+                and self.python_process.state() != QProcess.NotRunning
+            )
+        except Exception:
+            return False
+
+    def _open_cls_train(self):
+        """
+        打开分类训练/模型管理窗口。
+        训练与启用属于参数维护类权限，复用 auth.parameter_settings 的密码。
+        """
+        password, ok = QInputDialog.getText(
+            self,
+            "密码验证",
+            "分类训练与模型管理（工程/工艺专用）\n请输入密码:",
+            QLineEdit.Password,
+        )
+        if not ok:
+            return
+        if password != _read_auth_password("parameter_settings"):
+            QMessageBox.warning(self, "密码错误", "请输入正确的密码！", QMessageBox.Ok)
+            return
+
+        if not hasattr(self, "_cls_train_window") or self._cls_train_window is None:
+            self._cls_train_window = ClsTrainWindow(self, is_detect_running_fn=self._is_detect_running)
+        self._cls_train_window.show()
+        self._cls_train_window.raise_()
+        self._cls_train_window.activateWindow()
+
+    def _open_cls_wizard(self):
+        """工人小白入口：缺陷分类向导（不需要密码）。"""
+        if not hasattr(self, "_cls_wizard_window") or self._cls_wizard_window is None:
+            self._cls_wizard_window = ClsWizardWindow(self, is_detect_running_fn=self._is_detect_running)
+        self._cls_wizard_window.show()
+        self._cls_wizard_window.raise_()
+        self._cls_wizard_window.activateWindow()
 
     def apply_strip_count_preview(self, *_args):
         """切换带钢条数时立即刷新幅宽输入框与下方带钢显示区；不写 config0（检测前须点「确认」保存）。"""
@@ -1020,6 +1270,12 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.fukuan_3.setVisible(visible_count >= 3)
         if hasattr(self, "fukuan_4"):
             self.fukuan_4.setVisible(visible_count >= 4)
+        # 带钢卡号输入框与条数同步
+        if hasattr(self, "strip_card_edits"):
+            for i, ed in enumerate(self.strip_card_edits, start=1):
+                ed.setVisible(i <= visible_count)
+        if hasattr(self, "label_strip_card"):
+            self.label_strip_card.setVisible(True)
         row_h = 306
         row_gap = 16
         # 条带间距统一：不再单独给第一条额外留白
@@ -1060,6 +1316,61 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.strip_scroll_content.setMinimumSize(1761, max(900, y + 20))
         if hasattr(self, "label_title_15"):
             self._refresh_fukuan_status_layout()
+
+        # 同步每条带钢“显示标题”为带钢卡号（若已填写）
+        try:
+            cards = []
+            if hasattr(self, "strip_card_edits"):
+                cards = [ed.text().strip() for ed in self.strip_card_edits]
+            self._apply_strip_card_titles(cards)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _format_vertical_card_text(s: str, max_chars: int = 6) -> str:
+        s = str(s or "").strip()
+        if not s:
+            return ""
+        raw = s[:max_chars]
+        out = "\n".join(list(raw))
+        if len(s) > max_chars:
+            out += "\n…"
+        return out
+
+    def _apply_strip_card_titles(self, strip_cards):
+        """
+        将条带左侧窄标签改为优先显示“带钢卡号”。
+        UI 原始标签很窄，采用竖排显示，避免重叠。
+        """
+        cards = list(strip_cards or [])
+        cards = (cards + ["", "", "", ""])[:4]
+
+        # strip1~3：来自 mainui.py 的 label_title_12/13/14
+        for i, attr in enumerate(("label_title_12", "label_title_13", "label_title_14"), start=1):
+            if not hasattr(self, attr):
+                continue
+            w = getattr(self, attr)
+            card = str(cards[i - 1] or "").strip()
+            txt = self._format_vertical_card_text(card) if card else f"钢\n带\n{i}"
+            try:
+                w.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
+                w.setWordWrap(True)
+                w.setText(txt)
+                w.setToolTip(card if card else f"钢带{i}")
+            except Exception:
+                pass
+
+        # strip4：本工程动态创建 label_strip4_title
+        if hasattr(self, "label_strip4_title"):
+            card4 = str(cards[3] or "").strip()
+            txt4 = self._format_vertical_card_text(card4) if card4 else "钢\n带\n4"
+            try:
+                self.label_strip4_title.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
+                self.label_strip4_title.setWordWrap(True)
+                self.label_strip4_title.setText(txt4)
+                self.label_strip4_title.setToolTip(card4 if card4 else "钢带4")
+            except Exception:
+                pass
 
     def _init_external_axis_canvases(self):
         # 将坐标轴放在显示框外（左侧 + 下侧）
@@ -1210,11 +1521,21 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         return [self.label_down_pic1_2, self.label_down_pic2_2, self.label_down_pic3_2, self.label_down_pic4_2]
 
     def exchangeNEWONE(self):
+        if getattr(self, "_ui_detection_running", False):
+            QMessageBox.information(
+                self,
+                "无法换卷",
+                "检测处于运行状态时不能换卷。请先点击「暂停」停止界面刷新后，再执行换卷。",
+            )
+            return
         self.conduct_id.clear()
         self.fukuan_1.clear()  # 清空第一个检测系统幅宽输入框
         self.fukuan_2.clear()  # 清空第二个检测系统幅宽输入框
         self.fukuan_3.clear()  # 清空第三个检测系统幅宽输入框
         self.fukuan_4.clear()  # 清空第四个检测系统幅宽输入框
+        if hasattr(self, "strip_card_edits"):
+            for ed in self.strip_card_edits:
+                ed.clear()
         # product_cls 现为 QComboBox；换卷时保留型号选项，仅清空用户输入的自由文本
         if hasattr(self, 'product_cls_combo'):
             self.product_cls_combo.clearEditText()
@@ -1229,6 +1550,12 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             'fukuan_2': 0.0,
             'fukuan_3': 0.0,
             'fukuan_4': 0.0,
+            'strip_card_1': '',
+            'strip_card_2': '',
+            'strip_card_3': '',
+            'strip_card_4': '',
+            'strip_card_list': [],
+            'confirmed_at': '',
             'product_cls': ''
         }
         try:
@@ -1238,12 +1565,49 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             # 重置位置计数器
             self.pos = [0 for _ in range(self.MAX_STRIPS)]
             self.pos2 = [0 for _ in range(self.MAX_STRIPS)]
+            # 换卷：缺陷分布滑动窗口、幅宽曲线缓存与外置坐标轴需与 __init__ 一致复位；
+            # 否则上一卷的窗口刻度/红点仍留在界面上（create_button 在幅宽为 0 时不会清按钮）
+            for _i in range(self.MAX_STRIPS):
+                self.defect_points_up[_i] = []
+                self.defect_points_down[_i] = []
+                self.coordinate_queue[_i] = []
+                self.coordinate_queue2[_i] = []
+                self.wave_window_start_mm[_i] = 0.0
+                self.wave_window_end_mm[_i] = 1720.0
+                self.latest_defect_y[_i] = -1.0
+                self.last_multiple[_i] = -1
+                self.last_multiple2[_i] = -1
+                self.cm[_i] = 0
+                self.cm2[_i] = 0
+                self.base_folder[_i] = None
+                self.base_folder2[_i] = None
+                self.fukuan_mm[_i] = 0.0
+                self.fukuan_mm2[_i] = 0.0
+                self.abnormal_status[_i] = False
+                self.fukuan_last_measured[_i] = float("nan")
+                self.fukuan_tail_narrow[_i] = 0
+                self.display_end_indices[_i] = 0
+                self.display_smooth_end[_i] = 0.0
+                self.total_data[_i] = []
+            for _i in range(self.MAX_STRIPS):
+                self.refresh_buttons(_i)
+                self.refresh_buttons2(_i)
+            try:
+                self.update_all_plots()
+            except Exception:
+                pass
 
             QMessageBox.information(self, "输入信息",
                                     "已清空配置，请输入：\n"
-                                    "• 带钢产品号\n"
+                                    "• 质保书号\n"
                                     "• 需要的检测系统幅宽（不需要的设为0）\n"
+                                    "• 各条带钢卡号（与幅宽一一对应）\n"
                                     "• 产品型号")
+            try:
+                self._confirmed_this_session = False
+                self._refresh_start_stop_enabled()
+            except Exception:
+                pass
         except Exception as e:
             QMessageBox.warning(self, "重置失败", f"重置配置文件时出错: {str(e)}")
 
@@ -1258,6 +1622,9 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             fukuan_2_text = self.fukuan_2.text().strip()
             fukuan_3_text = self.fukuan_3.text().strip()
             fukuan_4_text = self.fukuan_4.text().strip()
+            strip_cards = []
+            if hasattr(self, "strip_card_edits"):
+                strip_cards = [ed.text().strip() for ed in self.strip_card_edits]
             product_cls = (
                 self._current_product_cls_key_from_combo()
                 if hasattr(self, "product_cls_combo")
@@ -1265,11 +1632,11 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             )
 
             print(
-                f"输入数据 - 卡号:'{conduct_id}', 幅宽1:'{fukuan_1_text}', 幅宽2:'{fukuan_2_text}', 幅宽3:'{fukuan_3_text}', 类别:'{product_cls}'")
+                f"输入数据 - 质保书号:'{conduct_id}', 幅宽1:'{fukuan_1_text}', 幅宽2:'{fukuan_2_text}', 幅宽3:'{fukuan_3_text}', 类别:'{product_cls}', 带钢卡号:{strip_cards}")
 
             # 验证必填字段
             if not conduct_id:
-                QMessageBox.warning(self, "输入错误", "带钢产品号不能为空！")
+                QMessageBox.warning(self, "输入错误", "质保书号不能为空！")
                 return
 
             if not product_cls:
@@ -1284,6 +1651,14 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
 
             print(f"转换后数值 - 幅宽1:{fukuan_1}, 幅宽2:{fukuan_2}, 幅宽3:{fukuan_3}")
 
+            # 校验：启用的条带若幅宽>0，则必须填写对应带钢卡号
+            strip_cards = (strip_cards + ["", "", "", ""])[:4]
+            fws = [fukuan_1, fukuan_2, fukuan_3, fukuan_4]
+            for i in range(self.system_count):
+                if float(fws[i]) > 0 and not str(strip_cards[i]).strip():
+                    QMessageBox.warning(self, "输入错误", f"第{i+1}条带钢已填写幅宽，但带钢卡号为空。请补充带钢卡号{i+1}。")
+                    return
+
             # 创建字典
             data = {
                 'conduct_id': conduct_id,
@@ -1293,12 +1668,30 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                 'fukuan_3': fukuan_3,
                 'fukuan_4': fukuan_4,
                 'fukuan_list': [fukuan_1, fukuan_2, fukuan_3, fukuan_4][:self.system_count],
+                'strip_card_1': strip_cards[0],
+                'strip_card_2': strip_cards[1],
+                'strip_card_3': strip_cards[2],
+                'strip_card_4': strip_cards[3],
+                'strip_card_list': strip_cards[:self.system_count],
+                'confirmed_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 'product_cls': product_cls
             }
             with open(os.path.join(_REPO_ROOT, 'config', 'config0.yaml'), 'w', encoding='utf-8') as file:
                 yaml.dump(data, file, allow_unicode=True)
 
             print("配置保存成功！")
+            # 本次会话已确认
+            self._confirmed_this_session = True
+
+            # 确认后：把条带标题/可见显示优先改成“带钢卡号”
+            try:
+                self._apply_strip_card_titles(strip_cards)
+            except Exception:
+                pass
+            try:
+                self._refresh_start_stop_enabled()
+            except Exception:
+                pass
 
             # 校验 rptcfg 中是否存在对应的允收矩阵，缺失则非阻塞提示
             try:
@@ -1332,19 +1725,103 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             print(f"FileNotFoundError: {fe}")
             QMessageBox.critical(self, "文件错误", error_msg)
 
-        except PermissionError as pe:
-            error_msg = f"权限不足: {str(pe)}\n请以管理员身份运行程序！"
-            print(f"PermissionError: {pe}")
-            QMessageBox.critical(self, "权限错误", error_msg)
+    def _config_ready_for_start(self) -> bool:
+        """未点击“确认”写入 config0 或关键字段不完整时，不允许开始/暂停。"""
+        # 必须是“本次打开主界面”后点过确认，避免沿用上次残留配置误启动
+        if not bool(getattr(self, "_confirmed_this_session", False)):
+            return False
+        try:
+            with open(os.path.join(_REPO_ROOT, "config", "config0.yaml"), "r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+        except Exception:
+            return False
+        if not str(cfg.get("confirmed_at", "") or "").strip():
+            return False
+        if not str(cfg.get("conduct_id", "") or "").strip():
+            return False
+        if not str(cfg.get("product_cls", "") or "").strip():
+            return False
+        try:
+            n = int(cfg.get("strip_count", 3) or 3)
+            n = min(4, max(1, n))
+        except Exception:
+            n = 3
+        fws = []
+        for i in range(1, 5):
+            try:
+                fws.append(float(cfg.get(f"fukuan_{i}", 0) or 0))
+            except Exception:
+                fws.append(0.0)
+        if not any(fws[i] > 0 for i in range(n)):
+            return False
+        cards = cfg.get("strip_card_list")
+        if not isinstance(cards, (list, tuple)):
+            cards = [
+                str(cfg.get("strip_card_1", "") or "").strip(),
+                str(cfg.get("strip_card_2", "") or "").strip(),
+                str(cfg.get("strip_card_3", "") or "").strip(),
+                str(cfg.get("strip_card_4", "") or "").strip(),
+            ]
+        cards = list(cards) + ["", "", "", ""]
+        for i in range(n):
+            if fws[i] > 0 and not str(cards[i] or "").strip():
+                return False
+        return True
 
-        except Exception as e:
-            error_msg = f"未知错误: {str(e)}\n请联系技术支持！"
-            print(f"Exception: {e}")
-            print(f"异常类型: {type(e)}")
-            import traceback
-            traceback.print_exc()  # 打印完整的错误堆栈
-            QMessageBox.critical(self, "系统错误", error_msg)
+    def _refresh_start_stop_enabled(self):
+        ok = self._config_ready_for_start()
+        try:
+            self.pushButton_start.setEnabled(bool(ok))
+        except Exception:
+            pass
+        try:
+            self.pushButton_stop.setEnabled(bool(ok))
+        except Exception:
+            pass
 
+    def _ensure_csharp_running(self) -> bool:
+        """C# 被手动关闭后，再次点击启动应能召回。"""
+        csharp_exe = r"D:\code\DalsaGrabDemoTcp\DalsaGrabDemoTcp\MultiCamDemo\bin\Debug\MultiCamDemo.exe"
+        csharp_workdir = r"D:\code\DalsaGrabDemoTcp\DalsaGrabDemoTcp\MultiCamDemo\bin\Debug"
+        if not os.path.exists(csharp_exe):
+            QMessageBox.critical(self, "启动失败", f"未找到 C# 程序：\n{csharp_exe}")
+            return False
+        proc = getattr(self, "csharp_process", None)
+        try:
+            running = (
+                proc is not None
+                and proc.state() != QProcess.NotRunning
+                and int(proc.processId() or 0) != 0
+            )
+        except Exception:
+            running = False
+        if running:
+            return True
+        try:
+            if proc is not None:
+                proc.kill()
+        except Exception:
+            pass
+        self.csharp_process = QProcess(self)
+        self.csharp_process.setProcessChannelMode(QProcess.MergedChannels)
+        self.csharp_process.setWorkingDirectory(csharp_workdir)
+        try:
+            self.csharp_process.finished.connect(lambda *_: setattr(self, "csharp_process", None))
+            self.csharp_process.errorOccurred.connect(lambda *_: setattr(self, "csharp_process", None))
+        except Exception:
+            pass
+        self.csharp_process.start(csharp_exe)
+        if not self.csharp_process.waitForStarted(5000):
+            error_state = self.csharp_process.error()
+            error_string = self.csharp_process.errorString()
+            QMessageBox.critical(
+                self,
+                "启动失败",
+                f"C# 程序启动失败！\n\n错误代码: {error_state}\n错误详情: {error_string}\n\n路径: {csharp_exe}",
+            )
+            self.csharp_process = None
+            return False
+        return True
 
     def baojing_close(self):
         ser = serial.Serial('COM4', 9600, timeout=1)
@@ -1391,7 +1868,11 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                 QMessageBox.warning(self, '密码错误', '请输入正确的密码！', QMessageBox.Ok)
 
     def closeEvent(self, event):
-        self.button_stop_click()#在窗口关闭时自动调用 button_stop_click()方法执行清理操作
+        # 关闭窗口：需要真正停掉接收端与外部进程（不同于“暂停”）
+        try:
+            self.button_stop_click()
+        finally:
+            self.terminate_processes()
         super().closeEvent(event)
 
     def button_stop_click(self):
@@ -1413,34 +1894,16 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                 self.loader_thread2[i].terminate()
                 self.loader_thread2[i].wait()
 
-        # 3. 停止外部进程 (修复了 poll 报错的问题)
+        # 3. 暂停策略：
+        # - 不杀 C# 发送端（它只负责发送）
+        # - 不杀 Python 接收端（保持 socket/连接，避免重连问题）
+        # - 仅通过运行态开关让接收端进入暂停（长度从 history_image_id 继续累加）
         try:
-            # 停止 C# 进程
-            if self.csharp_process:
-                # QProcess 使用 state() != QProcess.NotRunning 来判断是否在运行
-                if self.csharp_process.state() != QProcess.NotRunning:
-                    print("正在停止 C# 程序...")
-                    self.csharp_process.terminate()  # 发送终止信号
-                    # 等待最多1秒，如果还在运行则强制杀死
-                    if not self.csharp_process.waitForFinished(1000):
-                        print("C# 程序未响应，强制杀死...")
-                        self.csharp_process.kill()
-
-            # 停止 Python 进程
-            if self.python_process:
-                if self.python_process.state() != QProcess.NotRunning:
-                    print("正在停止 Python 图像处理程序...")
-                    self.python_process.terminate()
-                    if not self.python_process.waitForFinished(1000):
-                        print("Python 程序未响应，强制杀死...")
-                        self.python_process.kill()
-
-            # 不需要再调用 terminate_processes 了，上面已经处理完了
+            _write_runtime_state(paused=True)
 
             # 更新界面状态
-            self.run_state.setText("暂停")
-            self.run_state.setStyleSheet("color: red;")
-            print("所有进程已停止")
+            self._set_run_state(False)
+            print("已暂停：UI 停止刷新，接收端保活并从历史长度继续计数")
 
         except Exception as e:
             print(f"停止进程发生错误：{e}")
@@ -1468,7 +1931,38 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
 
 
     def  button_start_click(self):
-        self.start_programs()
+        # 继续/启动：
+        # - 若接收端已在运行，则仅取消暂停（不重启、不清零长度）
+        # - 若未运行，则正常启动（并确保 paused=False）
+        if not self._config_ready_for_start():
+            QMessageBox.information(
+                self,
+                "配置未确认",
+                "请先填写质保书号、幅宽与带钢卡号，并点击「确认」保存配置后再开始检测。",
+            )
+            self._set_run_state(False)
+            self._refresh_start_stop_enabled()
+            return
+        try:
+            if getattr(self, "python_process", None) is not None and self.python_process.state() != QProcess.NotRunning:
+                # Python 已在运行：这里是“继续”，但 C# 可能被手动关闭，需要尝试召回
+                try:
+                    self._ensure_csharp_running()
+                except Exception:
+                    pass
+                _write_runtime_state(paused=False)
+            else:
+                _write_runtime_state(paused=False)
+                self.start_programs()
+        except Exception:
+            # 启动流程里会有各类弹窗/检查，这里不因控制文件失败中断
+            self.start_programs()
+        # 启动成功后再显示运行
+        try:
+            running = getattr(self, "python_process", None) is not None and self.python_process.state() != QProcess.NotRunning
+        except Exception:
+            running = False
+        self._set_run_state(bool(running))
 
         with open(os.path.join(_REPO_ROOT, 'config', 'config.yaml'), 'r', encoding='utf-8') as file:
             config = yaml.safe_load(file)
@@ -1506,6 +2000,175 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             # 然后启动幅宽监测
         self.render_timer.start(33)
         self.showfukuan()
+
+    def _layout_status_panel(self) -> None:
+        """右上角：产线状态 + 检测状态，两行对齐、胶囊式状态值。"""
+        if getattr(self, "_status_panel_laid_out", False):
+            return
+        self._status_panel_laid_out = True
+
+        gb = self.groupBox_2
+        gb.setTitle("系统状态")
+        # 必须落在 frame_2 内，且与左侧「报告生成」按钮留出间隙（避免左边框与图标/标题挤在一起）
+        try:
+            fr = self.frame_2
+            fw = max(120, int(fr.width()))
+            fh = max(80, int(fr.height()))
+            right_m = 10
+            gap_after_report = 16
+            report_right = 0
+            try:
+                bg = self.pushButton_report.geometry()
+                br = int(bg.x() + bg.width())
+                # 「报告生成」文字标签可能比图标按钮更靠右，取二者最大右边界避免与系统状态框挤在一起
+                lr = 0
+                try:
+                    lg = self.label_ID_5.geometry()
+                    lr = int(lg.x() + lg.width())
+                except Exception:
+                    pass
+                report_right = max(br, lr)
+            except Exception:
+                pass
+            min_x = (report_right + gap_after_report) if report_right > 0 else 4
+
+            panel_w = min(168, fw - min_x - right_m)
+            panel_w = max(118, panel_w)
+            x = fw - panel_w - right_m
+            if x < min_x:
+                x = min_x
+                panel_w = max(118, fw - x - right_m)
+
+            panel_h = min(108, max(96, fh - 6))
+            gb.setGeometry(QRect(x, 2, panel_w, panel_h))
+        except Exception:
+            gb.setGeometry(QRect(600, 2, 160, 102))
+
+        gb.setFont(QFont("Microsoft YaHei UI", 10))
+        gb.setStyleSheet(
+            "QGroupBox#groupBox_2 { font-weight: 600; border: 1px solid #cfd8dc; border-radius: 6px; "
+            "margin-top: 8px; background: #fafafa; }"
+            "QGroupBox#groupBox_2::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; "
+            "color: #37474f; }"
+        )
+
+        outer = QVBoxLayout(gb)
+        outer.setContentsMargins(8, 18, 8, 8)
+        outer.setSpacing(6)
+
+        lbl_font = QFont("Microsoft YaHei UI", 9)
+        lbl_style = "color:#607d8b;"
+
+        lbl_line = QLabel("产线状态")
+        lbl_line.setFont(lbl_font)
+        lbl_line.setStyleSheet(lbl_style)
+        lbl_line.setMinimumWidth(52)
+        lbl_line.setMaximumWidth(52)
+        lbl_line.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+
+        # 去掉 designer 里 Arial 20pt + 强制调色板，否则胶囊会被撑出父控件
+        pill_font = QFont("Microsoft YaHei UI", 10, QFont.DemiBold)
+        self.run_state.setFont(pill_font)
+        self.run_state.setPalette(QApplication.palette())
+
+        self.line_state = QLabel("静止")
+        self.line_state.setFont(pill_font)
+        self.line_state.setObjectName("line_state_pill")
+        self.line_state.setAlignment(Qt.AlignCenter)
+        fm = QFontMetrics(pill_font)
+        pill_w = (
+            max(
+                fm.horizontalAdvance("运行"),
+                fm.horizontalAdvance("暂停"),
+                fm.horizontalAdvance("静止"),
+            )
+            + 12
+        )
+        pill_h = fm.height() + 8
+        self.line_state.setFixedSize(pill_w, pill_h)
+        self.line_state.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self._apply_line_state_style(False)
+
+        h1 = QHBoxLayout()
+        h1.setSpacing(6)
+        h1.setContentsMargins(0, 0, 0, 0)
+        h1.addWidget(lbl_line, 0, Qt.AlignVCenter)
+        h1.addStretch(1)
+        h1.addWidget(self.line_state, 0, Qt.AlignVCenter)
+
+        lbl_det = QLabel("检测状态")
+        lbl_det.setFont(lbl_font)
+        lbl_det.setStyleSheet(lbl_style)
+        lbl_det.setMinimumWidth(52)
+        lbl_det.setMaximumWidth(52)
+        lbl_det.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+
+        self.run_state.setObjectName("detect_state_pill")
+        self.run_state.setAlignment(Qt.AlignCenter)
+        self.run_state.setFixedSize(pill_w, pill_h)
+        self.run_state.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self._set_run_state(False)
+
+        h2 = QHBoxLayout()
+        h2.setSpacing(6)
+        h2.setContentsMargins(0, 0, 0, 0)
+        h2.addWidget(lbl_det, 0, Qt.AlignVCenter)
+        h2.addStretch(1)
+        h2.addWidget(self.run_state, 0, Qt.AlignVCenter)
+
+        outer.addLayout(h1)
+        outer.addLayout(h2)
+
+    def _apply_line_state_style(self, running: bool) -> None:
+        if not getattr(self, "line_state", None):
+            return
+        if running:
+            self.line_state.setStyleSheet(
+                "QLabel#line_state_pill { color:#0d47a1; background:#e3f2fd; "
+                "border:1px solid #90caf9; border-radius:8px; padding:2px 6px; }"
+            )
+        else:
+            self.line_state.setStyleSheet(
+                "QLabel#line_state_pill { color:#546e7a; background:#eceff1; "
+                "border:1px solid #cfd8dc; border-radius:8px; padding:2px 6px; }"
+            )
+
+    def _apply_detect_state_style(self, running: bool) -> None:
+        try:
+            if running:
+                self.run_state.setStyleSheet(
+                    "QLabel#detect_state_pill { color:#1b5e20; background:#e8f5e9; "
+                    "border:1px solid #81c784; border-radius:8px; padding:2px 6px; }"
+                )
+            else:
+                self.run_state.setStyleSheet(
+                    "QLabel#detect_state_pill { color:#b71c1c; background:#ffebee; "
+                    "border:1px solid #ef9a9a; border-radius:8px; padding:2px 6px; }"
+                )
+        except Exception:
+            pass
+
+    def _set_run_state(self, running: bool) -> None:
+        """统一设置右上角检测状态，避免分支遗漏导致状态错乱。"""
+        self._ui_detection_running = bool(running)
+        try:
+            self.run_state.setText("运行" if running else "暂停")
+            self._apply_detect_state_style(running)
+        except Exception:
+            pass
+
+    def _refresh_line_state(self) -> None:
+        """产线状态：若最近一段时间收到图片 => 运行，否则静止。"""
+        try:
+            if not getattr(self, "line_state", None):
+                return
+            ts = _read_line_heartbeat_ts()
+            now = time.time()
+            running = (ts > 0) and ((now - ts) <= 2.0)
+            self.line_state.setText("运行" if running else "静止")
+            self._apply_line_state_style(running)
+        except Exception:
+            pass
 
 
     def showfukuan(self):
@@ -1623,6 +2286,52 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         except Exception as e:
             print(f"plot_waveform系统{detection_system_index}发生错误：{e}")
 
+    @staticmethod
+    def _read_ui_defect_display_config(cfg=None):
+        """从 config.yaml 读取缺陷窗口/轴映射参数；cfg 为已 load 的字典时可传入避免重复读盘。"""
+        defaults = {
+            "target_window_m": 30.0,
+            "max_window_mm": 300_000.0,
+            "backtrack_max_mm": 150_000.0,
+            "lag_margin_mm": 20_000.0,
+            "nonlinear": False,
+            "tail_phys_ratio": 0.35,
+            "tail_pixel_ratio": 0.2,
+        }
+        if cfg is None:
+            try:
+                with open(
+                    os.path.join(_REPO_ROOT, "config", "config.yaml"),
+                    "r",
+                    encoding="utf-8",
+                ) as f:
+                    cfg = yaml.safe_load(f) or {}
+            except Exception:
+                cfg = {}
+        try:
+            return {
+                "target_window_m": float(
+                    cfg.get("ui_defect_window_target_m", defaults["target_window_m"])
+                ),
+                "max_window_mm": float(
+                    cfg.get("ui_defect_window_max_mm", defaults["max_window_mm"])
+                ),
+                "backtrack_max_mm": float(
+                    cfg.get("ui_defect_backtrack_max_mm", defaults["backtrack_max_mm"])
+                ),
+                "lag_margin_mm": float(
+                    cfg.get("ui_defect_lag_margin_mm", defaults["lag_margin_mm"])
+                ),
+                "nonlinear": bool(cfg.get("ui_defect_axis_nonlinear", False)),
+                "tail_phys_ratio": float(
+                    cfg.get("ui_defect_axis_tail_phys_ratio", defaults["tail_phys_ratio"])
+                ),
+                "tail_pixel_ratio": float(
+                    cfg.get("ui_defect_axis_tail_pixel_ratio", defaults["tail_pixel_ratio"])
+                ),
+            }
+        except Exception:
+            return dict(defaults)
 
     def update_all_plots(self):
         """
@@ -1634,8 +2343,19 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         font_path = os.path.join(_REPO_ROOT, 'config', 'simhei.ttf')
         font_prop = fm.FontProperties(fname=font_path)
 
-        # 横坐标窗口目标长度（单位：m）
-        TARGET_X_WINDOW_M = 30.0
+        try:
+            with open(
+                os.path.join(_REPO_ROOT, "config", "config.yaml"),
+                "r",
+                encoding="utf-8",
+            ) as f:
+                full_cfg = yaml.safe_load(f) or {}
+        except Exception:
+            full_cfg = {}
+        self._ui_defect_cfg = self._read_ui_defect_display_config(full_cfg)
+        ui = self._ui_defect_cfg
+        TARGET_X_WINDOW_M = ui["target_window_m"]
+
         # 浮点游标平滑参数：每帧至少前进 min_step 个采样点，追赶 gap 时按 alpha 比例 + 上限 max_step
         SMOOTH_MIN_STEP = 0.025
         SMOOTH_ALPHA = 0.14
@@ -1728,9 +2448,19 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                             window_len_mm = max(1e-9, window_end_mm - window_start_mm)
                             painter_b.drawLine(0, 0, x_max_px, 0)
                             for i_tick in range(11):
-                                x_rel = int(round(i_tick * x_max_px / 10.0))
+                                length_mm = window_start_mm + (i_tick / 10.0) * window_len_mm
+                                x_rel = int(
+                                    round(
+                                        _defect_length_mm_to_px(
+                                            length_mm,
+                                            window_start_mm,
+                                            window_end_mm,
+                                            x_max_px,
+                                            ui,
+                                        )
+                                    )
+                                )
                                 x_rel = max(0, min(x_max_px, x_rel))
-                                length_mm = window_start_mm + (x_rel / float(x_max_px)) * window_len_mm
                                 length_m = length_mm / 1000.0
                                 painter_b.drawLine(x_rel, 0, x_rel, 6)
                                 text_x = max(0, min(bottom_w - 42, x_rel - 21))
@@ -1766,9 +2496,9 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                     continue
 
                 # --- 3. 流动呈现逻辑（浮点游标 + 插值，窗口连续左移）---
-                with open(os.path.join(_REPO_ROOT, 'config', 'config.yaml'), 'r', encoding='utf-8') as file:
-                    config = yaml.safe_load(file)
-                ratio = config["cam1_standard_ratio_x"]
+                ratio = float(full_cfg.get("cam1_standard_ratio_x") or 0.0)
+                if abs(ratio) < 1e-12:
+                    ratio = 1.0
 
                 x_factor = ratio * 4096 * 0.001
                 x_step = x_factor if x_factor != 0 else 1.0
@@ -1804,9 +2534,30 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                     start_mm = desired_start_mm
 
                 # 限制最大窗口长度，避免锚定导致窗口无限拉长
-                max_window_mm = 300_000.0  # 300m
+                max_window_mm = float(ui["max_window_mm"])
                 if end_mm - start_mm > max_window_mm:
                     start_mm = end_mm - max_window_mm
+
+                # 检测滞后：缓存内仍有较小 y 的点时，向左扩展窗口以包住晚到的坐标（上下表面合并）
+                lag_margin = float(ui["lag_margin_mm"])
+                ymins = []
+                for _p in self.defect_points_up[system_index]:
+                    try:
+                        ymins.append(float(_p["y"]))
+                    except (KeyError, TypeError, ValueError):
+                        pass
+                for _p in self.defect_points_down[system_index]:
+                    try:
+                        ymins.append(float(_p["y"]))
+                    except (KeyError, TypeError, ValueError):
+                        pass
+                if ymins:
+                    y_min_cache = min(ymins)
+                    if y_min_cache < float(start_mm) + 1e-6:
+                        start_mm = min(float(start_mm), y_min_cache - lag_margin)
+                    start_mm = max(0.0, float(start_mm))
+                    if end_mm - start_mm > max_window_mm:
+                        start_mm = end_mm - max_window_mm
 
                 # 与缺陷图共用同一长度窗口（mm，与波形索引一致）
                 start_mm = max(0.0, float(start_mm))
@@ -1841,10 +2592,7 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                     )
                 )
 
-                # 内置绘图的像素映射：与外置刻度及缺陷点映射口径保持一致
-                span_idx = max(1e-9, end_f - start_f)
-                x_window = max(1e-9, span_idx * x_step)  # 米
-
+                # 内置绘图的像素映射：与外置刻度、缺陷红点同一套 mm->px（支持非线性尾段压缩）
                 button_w_px = 10
                 button_h_px = 10
                 left_pad = 0
@@ -1882,13 +2630,19 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                 painter_plot.setPen(pen_curve)
 
                 if len(x_plot) > 1 and len(y_plot_clamped) == len(x_plot):
-                    # 逐点连接，避免 QPainterPath 过大导致卡顿
+                    # x_plot 为相对窗口起点的长度（米）；绝对 mm = start_mm + 米*1000
                     px_prev = None
                     py_prev = None
-                    for xi, yi in zip(x_plot, y_plot_clamped):
-                        x_val = float(xi)
+                    for xv_m, yi in zip(x_plot, y_plot_clamped):
+                        y_abs_mm = float(start_mm) + float(xv_m) * 1000.0
+                        x_pix = int(
+                            round(
+                                _defect_length_mm_to_px(
+                                    y_abs_mm, float(start_mm), float(end_mm), x_max_px, ui
+                                )
+                            )
+                        )
                         y_val = float(yi)
-                        x_pix = int(round((x_val / x_window) * x_max_px))
                         y_pix = int(round((y_val / y_full) * y_max_px))
                         x_pix = max(0, min(x_max_px, x_pix))
                         y_pix = max(0, min(y_max_px, y_pix))
@@ -1924,9 +2678,19 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                         window_len_mm = max(1e-9, window_end_mm - window_start_mm)
                         painter_b.drawLine(0, 0, x_max_px, 0)
                         for i in range(11):
-                            x_rel = int(round(i * x_max_px / 10.0))
+                            length_mm = window_start_mm + (i / 10.0) * window_len_mm
+                            x_rel = int(
+                                round(
+                                    _defect_length_mm_to_px(
+                                        length_mm,
+                                        window_start_mm,
+                                        window_end_mm,
+                                        x_max_px,
+                                        ui,
+                                    )
+                                )
+                            )
                             x_rel = max(0, min(x_max_px, x_rel))
-                            length_mm = window_start_mm + (x_rel / float(x_max_px)) * window_len_mm
                             length_m = length_mm / 1000.0
                             painter_b.drawLine(x_rel, 0, x_rel, 6)
                             text_x = max(0, min(bottom_w - 42, x_rel - 21))
@@ -1974,14 +2738,17 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
 
     def start_programs(self):
         try:
+            # 启动/继续前：取消暂停（接收端读取该运行态控制）
+            _write_runtime_state(paused=False)
+
             with open(os.path.join(_REPO_ROOT, 'config', 'config0.yaml'), 'r', encoding='utf-8') as file:
                 config = yaml.safe_load(file)
 
             missing_configs = []
 
-            # 检查基本必需配置（带钢产品号与产品型号）
+            # 检查基本必需配置（质保书号与产品型号）
             if not config.get('conduct_id') or config['conduct_id'] == '':
-                missing_configs.append("带钢产品号")
+                missing_configs.append("质保书号")
             if not config.get('product_cls') or config['product_cls'] == '':
                 missing_configs.append("产品型号")
 
@@ -2014,76 +2781,31 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                 # =========================
                 python_exe = os.environ.get('STEEL_PYTHON_EXE', sys.executable)
 
-                # 若之前启动过，先清理（避免重复启动）
-                try:
-                    if hasattr(self, "python_process") and self.python_process is not None:
-                        if self.python_process.state() != QProcess.NotRunning:
-                            self.python_process.kill()
-                            self.python_process.waitForFinished(2000)
-                except Exception:
-                    pass
-
-                self.python_process = QProcess(self)
-
-                # 合并 stdout/stderr，避免你只连 stdout 结果报错信息丢了
-                self.python_process.setProcessChannelMode(QProcess.MergedChannels)
-
-                # 你原来只连了 StandardOutput，这里仍然走 handle_output 就够了
-                self.python_process.readyReadStandardOutput.connect(self.handle_output)
-
-                # 设置工作目录（强烈建议：相对路径/读取配置更稳定）
-                self.python_process.setWorkingDirectory(os.path.join(_REPO_ROOT))
-
-                # 启动
-                self.python_process.start(python_exe, ["-u", "-m", "app.online.detect_anomalies_online"])
-
-                if not self.python_process.waitForStarted(3000):
-                    QMessageBox.critical(self, "启动失败",
-                                         "Python 检测程序启动失败，请检查解释器路径/脚本路径/环境依赖。")
-                    return
+                # 若之前启动过且仍在运行：不重启（避免断连/长度重置）
+                if getattr(self, "python_process", None) is not None and self.python_process.state() != QProcess.NotRunning:
+                    print("Python 接收端已在运行，跳过重启（将直接继续）")
+                else:
+                    self.python_process = QProcess(self)
+                    # 合并 stdout/stderr，避免你只连 stdout 结果报错信息丢了
+                    self.python_process.setProcessChannelMode(QProcess.MergedChannels)
+                    # 你原来只连了 StandardOutput，这里仍然走 handle_output 就够了
+                    self.python_process.readyReadStandardOutput.connect(self.handle_output)
+                    # 设置工作目录（强烈建议：相对路径/读取配置更稳定）
+                    self.python_process.setWorkingDirectory(os.path.join(_REPO_ROOT))
+                    # 启动
+                    self.python_process.start(python_exe, ["-u", "-m", "app.online.detect_anomalies_online"])
+                    if not self.python_process.waitForStarted(3000):
+                        QMessageBox.critical(self, "启动失败",
+                                             "Python 检测程序启动失败，请检查解释器路径/脚本路径/环境依赖。")
+                        return
 
                 # =========================
-                # 2) 启动 C# 多相机程序（MultiCamDemo.exe）
+                # 2) 启动/召回 C# 多相机程序（MultiCamDemo.exe）
                 # =========================
-                csharp_exe = r"D:\code\DalsaGrabDemoTcp\DalsaGrabDemoTcp\MultiCamDemo\bin\Debug\MultiCamDemo.exe"
-                csharp_workdir = r"D:\code\DalsaGrabDemoTcp\DalsaGrabDemoTcp\MultiCamDemo\bin\Debug"
-
-                # 若之前启动过，先清理（避免重复启动）
-                try:
-                    if hasattr(self, "csharp_process") and self.csharp_process is not None:
-                        if self.csharp_process.state() != QProcess.NotRunning:
-                            self.csharp_process.kill()
-                            self.csharp_process.waitForFinished(2000)
-                except Exception:
-                    pass
-
-                # 检查 exe 是否存在（避免“启动了个空气”）
-                if not os.path.exists(csharp_exe):
-                    QMessageBox.critical(self, "启动失败", f"未找到 C# 程序：\n{csharp_exe}")
+                if not self._ensure_csharp_running():
                     return
 
-                self.csharp_process = QProcess(self)
-                self.csharp_process.setProcessChannelMode(QProcess.MergedChannels)
-                # 如果你也希望把C#输出显示到同一个 handle_output，可以接上：
-                # self.csharp_process.readyReadStandardOutput.connect(self.handle_output)
-                self.csharp_process.setWorkingDirectory(csharp_workdir)
-
-                self.csharp_process.start(csharp_exe)
-
-                if not self.csharp_process.waitForStarted(5000):
-                    # 获取详细错误信息
-                    error_state = self.csharp_process.error()
-                    error_string = self.csharp_process.errorString()
-
-                    QMessageBox.critical(self, "启动失败",
-                                         f"C# 程序启动失败！\n\n"
-                                         f"错误代码: {error_state}\n"
-                                         f"错误详情: {error_string}\n\n"
-                                         f"路径: {csharp_exe}")
-                    return
-
-                self.run_state.setText("运行")
-                self.run_state.setStyleSheet("color: green;")
+                self._set_run_state(True)
                 active_str = "、".join(active_systems)
                 print(f"系统启动成功，激活的系统: {active_str}")
                 for i in range(self.system_count):
@@ -2231,6 +2953,8 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             if window_len_mm <= 1e-6:
                 window_len_mm = max(1720.0, 1.0)
 
+            ui = getattr(self, "_ui_defect_cfg", None) or MainWindow._read_ui_defect_display_config()
+
             # 左轴（宽度mm）
             left_w = axis_left_label.width()
             left_h = axis_left_label.height()
@@ -2261,12 +2985,22 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             painter_b = QPainter(bottom_pm)
             painter_b.setPen(pen)
             painter_b.setFont(QFont("Arial", 8))
-            # 横轴主轴线（外侧）
+            # 横轴主轴线（外侧）；刻度位置与缺陷红点同一套 mm->px
             painter_b.drawLine(0, 0, x_max_px, 0)
             for i in range(11):
-                x_rel = int(round(i * x_max_px / 10.0))
+                length_mm = window_start_mm + (i / 10.0) * window_len_mm
+                x_rel = int(
+                    round(
+                        _defect_length_mm_to_px(
+                            length_mm,
+                            window_start_mm,
+                            window_end_mm,
+                            x_max_px,
+                            ui,
+                        )
+                    )
+                )
                 x_rel = max(0, min(x_max_px, x_rel))
-                length_mm = window_start_mm + (x_rel / float(x_max_px)) * window_len_mm
                 length_m = length_mm / 1000.0
                 painter_b.drawLine(x_rel, 0, x_rel, 6)
                 text_x = max(0, min(bottom_w - 42, x_rel - 21))
@@ -2311,10 +3045,12 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             window_end = self.wave_window_end_mm[system_index]
             window_len = max(1.0, window_end - window_start)
 
+            ui = getattr(self, "_ui_defect_cfg", None) or MainWindow._read_ui_defect_display_config()
+            max_backtrack_mm = float(ui["backtrack_max_mm"])
+
             points = self.defect_points_up[system_index]
             # 仅保留窗口附近点，控制内存与渲染量
             # 防止锚定后窗口长度变得很大，回溯距离过远导致按钮数量暴增
-            max_backtrack_mm = 150_000.0  # 150m
             backtrack_mm = min(window_len * 1.5, max_backtrack_mm)
             keep_from = window_start - backtrack_mm
             self.defect_points_up[system_index] = [p for p in points if p["y"] >= keep_from]
@@ -2326,8 +3062,17 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
 
             latest_visible = None
             for p in visible:
-                # 长度方向与幅宽波形使用同一窗口范围，保证同步滑动
-                button_x_rel = int(((p["y"] - window_start) / window_len) * x_max_px)
+                button_x_rel = int(
+                    round(
+                        _defect_length_mm_to_px(
+                            float(p["y"]),
+                            float(window_start),
+                            float(window_end),
+                            x_max_px,
+                            ui,
+                        )
+                    )
+                )
                 button_x_rel = max(0, min(x_max_px, button_x_rel))
                 button_x = x_origin + button_x_rel
 
@@ -2382,9 +3127,11 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             window_end = self.wave_window_end_mm[system_index]
             window_len = max(1.0, window_end - window_start)
 
+            ui = getattr(self, "_ui_defect_cfg", None) or MainWindow._read_ui_defect_display_config()
+            max_backtrack_mm = float(ui["backtrack_max_mm"])
+
             points = self.defect_points_down[system_index]
             # 防止锚定后窗口长度变得很大，回溯距离过远导致按钮数量暴增
-            max_backtrack_mm = 150_000.0  # 150m
             backtrack_mm = min(window_len * 1.5, max_backtrack_mm)
             keep_from = window_start - backtrack_mm
             self.defect_points_down[system_index] = [p for p in points if p["y"] >= keep_from]
@@ -2396,7 +3143,17 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
 
             latest_visible = None
             for p in visible:
-                button_x_rel = int(((p["y"] - window_start) / window_len) * x_max_px)
+                button_x_rel = int(
+                    round(
+                        _defect_length_mm_to_px(
+                            float(p["y"]),
+                            float(window_start),
+                            float(window_end),
+                            x_max_px,
+                            ui,
+                        )
+                    )
+                )
                 button_x_rel = max(0, min(x_max_px, button_x_rel))
                 button_x = x_origin + button_x_rel
 

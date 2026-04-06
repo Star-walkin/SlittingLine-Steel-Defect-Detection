@@ -43,12 +43,130 @@ except ImportError:
     detect_defects_by_local_contrast = None
     PATCHCORE_AVAILABLE = False
 
+
+def _get_safe_device():
+    """
+    安全获取 torch 设备：
+    - 在未编译 CUDA 或 CUDA 不可用时，统一回退到 CPU，避免
+      'Torch not compiled with CUDA enabled' 异常。
+    """
+    try:
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+    except Exception:
+        pass
+    return torch.device("cpu")
+
 # 全局写队列与锁（最小侵入）
 write_queue = queue.Queue()   # 全局写任务队列
 
 # 与 detectoutline02 一致：优雅退出、debug 目录去重
 shutdown_event = threading.Event()
+pause_event = threading.Event()
 _created_dirs = set()
+
+# 运行态控制（由主界面写入）：暂停/继续
+_RUNTIME_STATE_PATH = os.path.join(_REPO_ROOT, "config", "runtime_state.json")
+
+# 产线状态心跳（由接收端写入）：收到图片即刷新时间戳，UI 读取判断运行/静止
+_LINE_HEARTBEAT_PATH = os.path.join(_REPO_ROOT, "config", "line_heartbeat.json")
+_hb_lock = threading.Lock()
+_hb_last_recv_ts = {}  # cam_id -> epoch seconds
+
+
+def _read_paused_state() -> bool:
+    try:
+        with open(_RUNTIME_STATE_PATH, "r", encoding="utf-8") as f:
+            d = json.load(f) or {}
+        return bool(d.get("paused", False))
+    except Exception:
+        return False
+
+
+def _runtime_state_watcher():
+    """
+    运行态监控线程：读取 runtime_state.json 控制暂停/继续。
+    paused=True  -> pause_event.set()
+    paused=False -> pause_event.clear()
+    """
+    last = None
+    while not shutdown_event.is_set():
+        cur = _read_paused_state()
+        if cur != last:
+            if cur:
+                pause_event.set()
+                print("[state] paused=ON（跳过缺陷检测，仅保活接收并保持长度计数）")
+            else:
+                pause_event.clear()
+                print("[state] paused=OFF（恢复缺陷检测）")
+            last = cur
+        time.sleep(0.25)
+
+
+def _heartbeat_writer():
+    """
+    周期性把“最近一次收图时间戳”写到配置目录，供 UI 判定产线运行状态。
+    之所以独立线程写文件，是为了避免在 receive_images 高频 IO 影响吞吐。
+    """
+    last_dump = 0.0
+    while not shutdown_event.is_set():
+        now = time.time()
+        if now - last_dump < 0.5:
+            time.sleep(0.1)
+            continue
+        last_dump = now
+        try:
+            with _hb_lock:
+                per_cam = {str(k): float(v) for k, v in _hb_last_recv_ts.items()}
+                last_any = max(per_cam.values()) if per_cam else 0.0
+            payload = {"ts": float(last_any), "per_cam": per_cam}
+            os.makedirs(os.path.dirname(_LINE_HEARTBEAT_PATH), exist_ok=True)
+            tmp = _LINE_HEARTBEAT_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, _LINE_HEARTBEAT_PATH)
+        except Exception:
+            pass
+
+
+def _line_heartbeat_age_sec() -> float:
+    """距离 line_heartbeat.json 中最近一次收图的时间（秒）；读失败或从未收图则视为已静止很久。"""
+    try:
+        with open(_LINE_HEARTBEAT_PATH, "r", encoding="utf-8") as f:
+            d = json.load(f) or {}
+        ts = float(d.get("ts", 0) or 0)
+        if ts <= 0:
+            return 1e9
+        return max(0.0, time.time() - ts)
+    except Exception:
+        return 1e9
+
+
+_line_idle_cfg_cache = None
+_line_idle_cfg_mtime = 0.0
+
+
+def _get_line_idle_catchup_cfg():
+    """产线静止追平：是否启用、静止判定秒数、单次最多连处理帧数（带 mtime 缓存）。"""
+    global _line_idle_cfg_cache, _line_idle_cfg_mtime
+    path = os.path.join(_REPO_ROOT, "config", "config.yaml")
+    try:
+        mtime = os.path.getmtime(path)
+        if _line_idle_cfg_cache is not None and mtime == _line_idle_cfg_mtime:
+            return _line_idle_cfg_cache
+        with open(path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        en = bool(cfg.get("line_idle_catchup_enable", True))
+        stale = float(cfg.get("line_idle_stale_sec", 2.0) or 2.0)
+        mx = int(cfg.get("line_idle_catchup_max_frames", 40) or 40)
+        mx = max(1, min(mx, 300))
+        stale = max(0.3, stale)
+        _line_idle_cfg_cache = (en, stale, mx)
+        _line_idle_cfg_mtime = mtime
+        return _line_idle_cfg_cache
+    except Exception:
+        return (True, 2.0, 40)
+
 
 # per-camera lock 防止并发修改内存 list 结构（按相机一级锁）
 # 注意：在 main 中我们会根据 num_cams 初始化 cam_locks
@@ -267,13 +385,13 @@ def init_detect(conduct_id, result_path_all, Consecutive_thres_num, cam_index):
             root_dir = os.path.dirname(os.path.abspath(__file__))
             _weights_root_name = config.get("patchcore_weights_root", "weights")
             patchcore_root = os.path.join(
-                root_dir, "patchcore_model", _weights_root_name, "image_data_patchcore_0228"
+                root_dir, "models", "patchcore_model", _weights_root_name, "image_data_patchcore_0228"
             )
             cam_name = f"CAM{cam_index + 1}"
             memory_path = os.path.join(patchcore_root, cam_name, "patchcore_memory.npz")
             if os.path.isfile(memory_path):
                 print(f"[CAM{cam_index + 1}] 使用 PatchCoreDetector: {memory_path}")
-                _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                _device = _get_safe_device()
                 M = PatchCoreDetector(
                     memory_path=memory_path,
                     conduct_id=conduct_id,
@@ -299,10 +417,9 @@ def init_detect(conduct_id, result_path_all, Consecutive_thres_num, cam_index):
             else:
                 raise FileNotFoundError(
                     f"[CAM{cam_index + 1}] 未找到 PatchCore 权重文件：{memory_path}\n"
-                    f"请检查：patchcore_model/{_weights_root_name}/image_data_patchcore_0228/{cam_name}/patchcore_memory.npz"
+                    f"请检查：models/patchcore_model/{_weights_root_name}/image_data_patchcore_0228/{cam_name}/patchcore_memory.npz"
                 )
         except Exception as e:
-            # PatchCore-only：初始化失败直接抛出，避免悄悄回退到其它模型
             raise RuntimeError(f"[CAM{cam_index + 1}] PatchCoreDetector 初始化失败: {e}") from e
 
     F = get_one_image_list(cut_ratio=cut_ratio, standard_ratio_x=standard_ratio_x, fukuan0=fukuan0)
@@ -536,6 +653,12 @@ def receive_images(sock, cam_id, image_queue):
 
             try:
                 image_queue.put((image_data, index))
+                # ---- 产线心跳：收到一帧就刷新（只更新内存；落盘由 _heartbeat_writer 周期写）----
+                try:
+                    with _hb_lock:
+                        _hb_last_recv_ts[int(cam_id)] = time.time()
+                except Exception:
+                    pass
                 # ---- 记录输入帧率 ----
                 _mon_r = get_monitor()
                 if _mon_r:
@@ -578,6 +701,219 @@ def worker(image_queue, cam_id, history_image_id_list, M, F, Checker, info_proce
     processed_count = 0
     print(f"Worker {local_name} 启动 (Model Channels: {model_channels})...")
 
+    def process_one_image(image_data, idx):
+        nonlocal processed_count, last_splits, last_measured_widths
+        # ---- 队列水位监控 ----
+        _mon_w = get_monitor()
+        if _mon_w:
+            _mon_w.record_qsize(cam_id, image_queue.qsize())
+
+        # ---- 解码阶段计时 ----
+        _t_decode = time.perf_counter()
+        nparr = np.frombuffer(image_data, np.uint8)
+        gray = None
+        if nparr.size == 4096 * 4096:
+            gray = nparr.reshape((4096, 4096))
+        else:
+            try:
+                decoded_img = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
+                if decoded_img is not None:
+                    gray = cv2.resize(decoded_img, (4096, 4096)) if decoded_img.shape != (4096, 4096) else decoded_img
+            except Exception:
+                pass
+        if _mon_w:
+            _mon_w.record_stage(cam_id, "decode", time.perf_counter() - _t_decode)
+
+        if gray is None:
+            image_queue.task_done()
+            return
+
+        # 整帧（切分、帧号、detect）放在同一相机锁内，避免双 worker 与 detectoutline02 单 worker 语义一致且 ID 不重复
+        strip_tasks = []  # 在 cam_lock 外初始化，防止 continue 路径后未定义
+        lock = cam_locks[cam_id] if cam_locks is not None else dummy_context()
+        with (lock if hasattr(lock, "__enter__") else dummy_context()):
+            try:
+                fukuan_est = [
+                    np.mean(fukuan_list[i]) if len(fukuan_list[i]) > 0 else F.fukuan0[i]
+                    for i in range(len(F.fukuan0))
+                ]
+            except Exception:
+                fukuan_est = F.fukuan0
+
+            need_recalc = (last_splits is None) or (processed_count % SPLIT_RECALC_EVERY_N == 0)
+            if need_recalc:
+                try:
+                    with StageTimer(cam_id, "split"):
+                        strip_imgs, measured_widths_mm, splits = split_multi_strips(
+                            gray,
+                            fukuan_list_mm=fukuan_est,
+                            standard_ratio_x=F.standard_ratio_x,
+                            cam_id=cam_id,
+                            use_thumbnail=True,   # 缩略图定位加速（~3x）
+                        )
+                    last_splits = splits
+                    last_measured_widths = measured_widths_mm
+                except Exception:
+                    if last_splits:
+                        strip_imgs = cut_by_splits(gray, last_splits)
+                        measured_widths_mm = last_measured_widths
+                    else:
+                        image_queue.task_done()
+                        return
+            else:
+                strip_imgs = cut_by_splits(gray, last_splits)
+                measured_widths_mm = last_measured_widths if last_measured_widths else fukuan_est
+
+            expected_num = len(F.fukuan0)
+            actual_num = len(strip_imgs)
+            if actual_num != expected_num:
+                print(f"[{local_name}][warn] split条数不一致 expected={expected_num}, actual={actual_num}")
+            iter_num = min(actual_num, expected_num, len(image_anomaly_center_list), len(image_anomaly_area_list))
+            if iter_num <= 0:
+                image_queue.task_done()
+                return
+
+            # 与 detectoutline02 一致：每帧递增一次全局序号，本帧各条带共用同一 new_id
+            last_id = history_image_id_list[cam_id]
+            new_id = last_id + 1
+            history_image_id_list[cam_id] = new_id
+            write_queue.put({
+                "type": "save_history_id",
+                "info_process": info_process,
+                "value": {"last_id": new_id},
+            })
+
+            # split_vis: 仅在 speed_monitor.DEBUG_IO=True 时写盘。
+            # 为避免 OOM：对可视化图做降采样（不影响检测本身，仅影响调试文件）。
+            if speed_monitor.DEBUG_IO:
+                _t_dbg = time.perf_counter()
+                try:
+                    vis_dir = os.path.join(save_root, "split_vis")
+                    os.makedirs(vis_dir, exist_ok=True)
+
+                    H_full, W_full = gray.shape[0], gray.shape[1]
+                    split_vis_max_side = 2048
+                    mx = max(H_full, W_full)
+                    scale = min(1.0, float(split_vis_max_side) / float(mx))
+
+                    if scale < 1.0:
+                        nw = max(1, int(round(W_full * scale)))
+                        nh = max(1, int(round(H_full * scale)))
+                        gray_vis = cv2.resize(gray, (nw, nh), interpolation=cv2.INTER_AREA)
+                        sx = nw / float(W_full)
+                        sy = nh / float(H_full)
+                        thick = max(1, int(round(3 * scale)))
+                        font_scale = max(0.4, float(1.2 * scale))
+                        text_thick = max(1, int(round(2 * scale)))
+                        line_thick = max(1, int(round(1 * scale)))
+                    else:
+                        gray_vis = gray
+                        sx = sy = 1.0
+                        thick = 3
+                        font_scale = 1.2
+                        text_thick = 2
+                        line_thick = 1
+
+                    H_vis, W_vis = gray_vis.shape[0], gray_vis.shape[1]
+                    vis = cv2.cvtColor(gray_vis, cv2.COLOR_GRAY2BGR)
+
+                    cut_ratio = getattr(M, "cut_ratio", 3)
+                    strip_colors = [(0, 0, 255), (0, 255, 0), (255, 0, 0), (0, 255, 255)]
+                    for si, (L, R) in enumerate(last_splits):
+                        color = strip_colors[si % len(strip_colors)]
+                        Li, Ri = int(L * sx), int(R * sx)
+                        cv2.rectangle(vis, (Li, 0), (Ri, H_vis - 1), color, thick)
+                        for j in range(1, cut_ratio):
+                            y = int(H_vis * j / cut_ratio)
+                            cv2.line(vis, (Li, y), (Ri, y), color, line_thick)
+                        cv2.putText(
+                            vis,
+                            f"strip{si+1}",
+                            (Li + max(4, int(10 * sx)), max(16, int(40 * sy))),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            font_scale,
+                            color,
+                            text_thick,
+                            cv2.LINE_AA,
+                        )
+
+                    out_path = os.path.join(vis_dir, f"frame_{new_id:06d}.png")
+                    cv2.imwrite(out_path, vis)
+                    del vis
+                except Exception as e_vis:
+                    print(f"[{local_name}] split_vis error: {e_vis}")
+                _mon_dbg = get_monitor()
+                if _mon_dbg:
+                    _mon_dbg.record_stage(cam_id, "debug_io", time.perf_counter() - _t_dbg)
+
+            # 收集本帧各条带的任务参数（cam_lock 内仅做 CPU 准备）
+            strip_tasks = []
+            for i in range(iter_num):
+                strip_tasks.append((
+                    strip_imgs[i],
+                    new_id,
+                    i,
+                    measured_widths_mm[i] if i < len(measured_widths_mm) else fukuan_est[i],
+                ))
+
+        # ---- 暂停 / 轻量模式：只写幅宽（并保持 history_image_id 继续递增），跳过缺陷检测 ----
+        # 暂停时不杀发送端/不关连接，只是让接收端不做缺陷推理；长度从历史继续走。
+        if pause_event.is_set() or (cam_id in lite_cam_ids):
+            for _, nid, sid, fw in strip_tasks:
+                fukuan_path = os.path.join(save_root, f"strip_{sid + 1}", "fukuan.json")
+                write_queue.put({"type": "append_fukuan", "fpath": fukuan_path, "value": float(fw)})
+            processed_count += 1
+            image_queue.task_done()
+            _mon_p = get_monitor()
+            if _mon_p:
+                _mon_p.record_processed(cam_id)
+            return
+
+        # ---- 推理阶段：在 cam_lock 外通过 InferEngine 执行，允许另一个 worker 同步做 CPU 预处理 ----
+        if infer_engine is not None:
+            # 向 InferEngine 提交所有条带任务，立即获得 Future（非阻塞）
+            futures = []
+            for strip_np, nid, sid, fw in strip_tasks:
+                future = infer_engine.submit(
+                    detect,
+                    strip_np, nid, cam_id, sid,
+                    M, F, Checker, info_process, save_root, Consecutive_Check,
+                    image_anomaly_center_list[sid],
+                    image_anomaly_area_list[sid],
+                    fw,
+                    model_channels=model_channels,
+                )
+                futures.append(future)
+            # 等待本帧所有条带推理完成
+            for future in futures:
+                try:
+                    future.result()
+                except Exception as e:
+                    print(f"[ERR] {local_name} InferEngine error idx={idx}: {e}")
+                    traceback.print_exc()
+        else:
+            # 回退路径：直接调用（不使用 InferEngine）
+            for strip_np, nid, sid, fw in strip_tasks:
+                try:
+                    detect(
+                        strip_np, nid, cam_id, sid,
+                        M, F, Checker, info_process, save_root, Consecutive_Check,
+                        image_anomaly_center_list[sid],
+                        image_anomaly_area_list[sid],
+                        fw,
+                        model_channels=model_channels,
+                    )
+                except Exception as e:
+                    print(f"[ERR] {local_name} detect error strip{sid} idx={idx}: {e}")
+                    traceback.print_exc()
+
+        processed_count += 1
+
+        image_queue.task_done()
+        # ---- 记录本帧处理完成 ----
+        _mon_p = get_monitor()
+        if _mon_p:
+            _mon_p.record_processed(cam_id)
     try:
         while not shutdown_event.is_set():
             try:
@@ -592,216 +928,33 @@ def worker(image_queue, cam_id, history_image_id_list, M, F, Checker, info_proce
             if image_data is None:
                 break
 
-            # ---- 队列水位监控 ----
-            _mon_w = get_monitor()
-            if _mon_w:
-                _mon_w.record_qsize(cam_id, image_queue.qsize())
+            process_one_image(image_data, idx)
 
-            # ---- 解码阶段计时 ----
-            _t_decode = time.perf_counter()
-            nparr = np.frombuffer(image_data, np.uint8)
-            gray = None
-            if nparr.size == 4096 * 4096:
-                gray = nparr.reshape((4096, 4096))
-            else:
-                try:
-                    decoded_img = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
-                    if decoded_img is not None:
-                        gray = cv2.resize(decoded_img, (4096, 4096)) if decoded_img.shape != (4096, 4096) else decoded_img
-                except Exception:
-                    pass
-            if _mon_w:
-                _mon_w.record_stage(cam_id, "decode", time.perf_counter() - _t_decode)
-
-            if gray is None:
-                image_queue.task_done()
-                continue
-
-            # 整帧（切分、帧号、detect）放在同一相机锁内，避免双 worker 与 detectoutline02 单 worker 语义一致且 ID 不重复
-            strip_tasks = []  # 在 cam_lock 外初始化，防止 continue 路径后未定义
-            lock = cam_locks[cam_id] if cam_locks is not None else dummy_context()
-            with (lock if hasattr(lock, "__enter__") else dummy_context()):
-                try:
-                    fukuan_est = [
-                        np.mean(fukuan_list[i]) if len(fukuan_list[i]) > 0 else F.fukuan0[i]
-                        for i in range(len(F.fukuan0))
-                    ]
-                except Exception:
-                    fukuan_est = F.fukuan0
-
-                need_recalc = (last_splits is None) or (processed_count % SPLIT_RECALC_EVERY_N == 0)
-                if need_recalc:
+            _exit_worker = False
+            en, stale_sec, mx = _get_line_idle_catchup_cfg()
+            if en and (not pause_event.is_set()) and (not shutdown_event.is_set()):
+                bn = 0
+                while bn < mx and (not shutdown_event.is_set()):
+                    if pause_event.is_set():
+                        break
+                    if _line_heartbeat_age_sec() <= stale_sec:
+                        break
                     try:
-                        with StageTimer(cam_id, "split"):
-                            strip_imgs, measured_widths_mm, splits = split_multi_strips(
-                                gray,
-                                fukuan_list_mm=fukuan_est,
-                                standard_ratio_x=F.standard_ratio_x,
-                                cam_id=cam_id,
-                                use_thumbnail=True,   # 缩略图定位加速（~3x）
-                            )
-                        last_splits = splits
-                        last_measured_widths = measured_widths_mm
-                    except Exception:
-                        if last_splits:
-                            strip_imgs = cut_by_splits(gray, last_splits)
-                            measured_widths_mm = last_measured_widths
-                        else:
-                            image_queue.task_done()
-                            continue
-                else:
-                    strip_imgs = cut_by_splits(gray, last_splits)
-                    measured_widths_mm = last_measured_widths if last_measured_widths else fukuan_est
+                        item_n = image_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    if item_n is None:
+                        _exit_worker = True
+                        break
+                    idn, ixn = item_n
+                    if idn is None:
+                        _exit_worker = True
+                        break
+                    process_one_image(idn, ixn)
+                    bn += 1
+            if _exit_worker:
+                break
 
-                expected_num = len(F.fukuan0)
-                actual_num = len(strip_imgs)
-                if actual_num != expected_num:
-                    print(f"[{local_name}][warn] split条数不一致 expected={expected_num}, actual={actual_num}")
-                iter_num = min(actual_num, expected_num, len(image_anomaly_center_list), len(image_anomaly_area_list))
-                if iter_num <= 0:
-                    image_queue.task_done()
-                    continue
-
-                # 与 detectoutline02 一致：每帧递增一次全局序号，本帧各条带共用同一 new_id
-                last_id = history_image_id_list[cam_id]
-                new_id = last_id + 1
-                history_image_id_list[cam_id] = new_id
-                write_queue.put({
-                    "type": "save_history_id",
-                    "info_process": info_process,
-                    "value": {"last_id": new_id},
-                })
-
-                # split_vis: 仅在 speed_monitor.DEBUG_IO=True 时写盘。
-                # 为避免 OOM：对可视化图做降采样（不影响检测本身，仅影响调试文件）。
-                if speed_monitor.DEBUG_IO:
-                    _t_dbg = time.perf_counter()
-                    try:
-                        vis_dir = os.path.join(save_root, "split_vis")
-                        os.makedirs(vis_dir, exist_ok=True)
-
-                        H_full, W_full = gray.shape[0], gray.shape[1]
-                        split_vis_max_side = 2048
-                        mx = max(H_full, W_full)
-                        scale = min(1.0, float(split_vis_max_side) / float(mx))
-
-                        if scale < 1.0:
-                            nw = max(1, int(round(W_full * scale)))
-                            nh = max(1, int(round(H_full * scale)))
-                            gray_vis = cv2.resize(gray, (nw, nh), interpolation=cv2.INTER_AREA)
-                            sx = nw / float(W_full)
-                            sy = nh / float(H_full)
-                            thick = max(1, int(round(3 * scale)))
-                            font_scale = max(0.4, float(1.2 * scale))
-                            text_thick = max(1, int(round(2 * scale)))
-                            line_thick = max(1, int(round(1 * scale)))
-                        else:
-                            gray_vis = gray
-                            sx = sy = 1.0
-                            thick = 3
-                            font_scale = 1.2
-                            text_thick = 2
-                            line_thick = 1
-
-                        H_vis, W_vis = gray_vis.shape[0], gray_vis.shape[1]
-                        vis = cv2.cvtColor(gray_vis, cv2.COLOR_GRAY2BGR)
-
-                        cut_ratio = getattr(M, "cut_ratio", 3)
-                        strip_colors = [(0, 0, 255), (0, 255, 0), (255, 0, 0), (0, 255, 255)]
-                        for si, (L, R) in enumerate(last_splits):
-                            color = strip_colors[si % len(strip_colors)]
-                            Li, Ri = int(L * sx), int(R * sx)
-                            cv2.rectangle(vis, (Li, 0), (Ri, H_vis - 1), color, thick)
-                            for j in range(1, cut_ratio):
-                                y = int(H_vis * j / cut_ratio)
-                                cv2.line(vis, (Li, y), (Ri, y), color, line_thick)
-                            cv2.putText(
-                                vis,
-                                f"strip{si+1}",
-                                (Li + max(4, int(10 * sx)), max(16, int(40 * sy))),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                font_scale,
-                                color,
-                                text_thick,
-                                cv2.LINE_AA,
-                            )
-
-                        out_path = os.path.join(vis_dir, f"frame_{new_id:06d}.png")
-                        cv2.imwrite(out_path, vis)
-                        del vis
-                    except Exception as e_vis:
-                        print(f"[{local_name}] split_vis error: {e_vis}")
-                    _mon_dbg = get_monitor()
-                    if _mon_dbg:
-                        _mon_dbg.record_stage(cam_id, "debug_io", time.perf_counter() - _t_dbg)
-
-                # 收集本帧各条带的任务参数（cam_lock 内仅做 CPU 准备）
-                strip_tasks = []
-                for i in range(iter_num):
-                    strip_tasks.append((
-                        strip_imgs[i],
-                        new_id,
-                        i,
-                        measured_widths_mm[i] if i < len(measured_widths_mm) else fukuan_est[i],
-                    ))
-
-            # ---- 轻量模式：CAM1/4 只写幅宽，跳过全量缺陷检测，释放 GPU 给 CAM2/3 ----
-            if cam_id in lite_cam_ids:
-                for _, nid, sid, fw in strip_tasks:
-                    fukuan_path = os.path.join(save_root, f"strip_{sid + 1}", "fukuan.json")
-                    write_queue.put({"type": "append_fukuan", "fpath": fukuan_path, "value": float(fw)})
-                processed_count += 1
-                image_queue.task_done()
-                _mon_p = get_monitor()
-                if _mon_p:
-                    _mon_p.record_processed(cam_id)
-                continue
-
-            # ---- 推理阶段：在 cam_lock 外通过 InferEngine 执行，允许另一个 worker 同步做 CPU 预处理 ----
-            if infer_engine is not None:
-                # 向 InferEngine 提交所有条带任务，立即获得 Future（非阻塞）
-                futures = []
-                for strip_np, nid, sid, fw in strip_tasks:
-                    future = infer_engine.submit(
-                        detect,
-                        strip_np, nid, cam_id, sid,
-                        M, F, Checker, info_process, save_root, Consecutive_Check,
-                        image_anomaly_center_list[sid],
-                        image_anomaly_area_list[sid],
-                        fw,
-                        model_channels=model_channels,
-                    )
-                    futures.append(future)
-                # 等待本帧所有条带推理完成
-                for future in futures:
-                    try:
-                        future.result()
-                    except Exception as e:
-                        print(f"[ERR] {local_name} InferEngine error idx={idx}: {e}")
-                        traceback.print_exc()
-            else:
-                # 回退路径：直接调用（不使用 InferEngine）
-                for strip_np, nid, sid, fw in strip_tasks:
-                    try:
-                        detect(
-                            strip_np, nid, cam_id, sid,
-                            M, F, Checker, info_process, save_root, Consecutive_Check,
-                            image_anomaly_center_list[sid],
-                            image_anomaly_area_list[sid],
-                            fw,
-                            model_channels=model_channels,
-                        )
-                    except Exception as e:
-                        print(f"[ERR] {local_name} detect error strip{sid} idx={idx}: {e}")
-                        traceback.print_exc()
-
-            processed_count += 1
-
-            image_queue.task_done()
-            # ---- 记录本帧处理完成 ----
-            _mon_p = get_monitor()
-            if _mon_p:
-                _mon_p.record_processed(cam_id)
 
     except Exception as e:
         print(f"[ERR] worker unexpected error cam={cam_id}: {e}")
@@ -829,6 +982,14 @@ def run_online(cwd_base_result=None):
                                         datetime.now().strftime("%Y%m%d"),
                                         f"{conduct_id}")
     os.makedirs(base_result_path, exist_ok=True)
+
+    # 写入 config0 快照：供报告中心/修改界面直接读取带钢卡号（无需先生成报告）
+    try:
+        snap0 = os.path.join(base_result_path, "config0_snapshot.yaml")
+        with open(snap0, "w", encoding="utf-8") as f:
+            yaml.dump(dict(config0 or {}), f, allow_unicode=True)
+    except Exception:
+        pass
 
     # 读取其它配置
     with open(os.path.join(_REPO_ROOT, 'config', 'config.yaml'), 'r', encoding='utf-8') as f:
@@ -882,6 +1043,14 @@ def run_online(cwd_base_result=None):
     # 启动单个 writer（全局唯一）
     writer_t = threading.Thread(target=writer_loop, daemon=True)
     writer_t.start()
+
+    # 启动运行态监控（暂停/继续）
+    state_t = threading.Thread(target=_runtime_state_watcher, daemon=True)
+    state_t.start()
+
+    # 启动产线心跳写盘（运行/静止判定）
+    hb_t = threading.Thread(target=_heartbeat_writer, daemon=True)
+    hb_t.start()
 
     # 保存线程 / sockets / engines 引用以便 join/close
     recv_threads = []

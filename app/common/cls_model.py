@@ -1,9 +1,14 @@
 import os
-_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.models import resnet18,wide_resnet50_2
+from torchvision.models import resnet18, wide_resnet50_2
+try:
+    # torchvision>=0.13
+    from torchvision.models import ResNet18_Weights
+except Exception:
+    ResNet18_Weights = None  # type: ignore
 
 
 class ProjectionNet(nn.Module):
@@ -11,7 +16,13 @@ class ProjectionNet(nn.Module):
         super(ProjectionNet, self).__init__()
         #self.resnet18 = torch.hub.load('pytorch/vision:v0.9.0', 'resnet18', pretrained=pretrained)
         #self.resnet18 = resnet18(pretrained=pretrained)
-        self.resnet18=resnet18(pretrained=pretrained)
+        # 兼容 torchvision 新版 API：pretrained 已弃用，使用 weights
+        if ResNet18_Weights is not None:
+            weights = ResNet18_Weights.DEFAULT if pretrained else None
+            self.resnet18 = resnet18(weights=weights)
+        else:
+            # 旧版本 fallback
+            self.resnet18 = resnet18(pretrained=pretrained)
         # create MPL head as seen in the code in: https://github.com/uoguelph-mlrg/Cutout/blob/master/util/cutout.py
         # TODO: check if this is really the right architecture
         last_layer = 512

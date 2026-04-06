@@ -20,7 +20,7 @@ if ROOT not in sys.path:
 
 from det_model.prepare_dataset_det import preprocess_like_inference  # noqa: E402
 from det_model.infer import preprocess_like_inference_gpu             # noqa: E402
-from app.common.function_bank import test_one_image  # noqa: E402
+from function_bank import test_one_image  # noqa: E402
 
 
 class FeatureExtractor(torch.nn.Module):
@@ -166,8 +166,14 @@ class PatchCoreDetector:
         patchcore_edge_strength: float = 1.0,
         patchcore_edge_weight_profile: str = "ease_out_cubic",
     ):
+        # 安全选择设备：在未编译 CUDA 或 CUDA 不可用时回退到 CPU，
+        # 避免 "Torch not compiled with CUDA enabled" 直接中断初始化。
         if device is None:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            try:
+                use_cuda = torch.cuda.is_available()
+            except Exception:
+                use_cuda = False
+            device = torch.device("cuda" if use_cuda else "cpu")
         self.device = device
 
         # 读取 PatchCore 记忆库

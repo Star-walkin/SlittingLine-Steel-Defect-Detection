@@ -1,6 +1,6 @@
 """
 det_model/prepare_dataset_det.py
-将原始图像处理成与「线上推理」一致的预处理（供 PatchCore/离线工具复用）。
+将原始图像处理成与「离线检测」完全一致的预处理，生成可直接用于 SimpleAD 训练的数据集。
 
 与离线检测对齐的预处理流程（与 det_model/infer.py SlidingWindowDetector.detect_ano 一致）：
   1. 灰度
@@ -9,7 +9,7 @@ det_model/prepare_dataset_det.py
   4. 纵向滤波（apply_vertical_filter）：去除轧制纹/列 PRNU
   5. 背景拍平：中值滤波 + 减背景 + 背景均值补偿
 
-数据集步骤：
+数据集处理步骤（仅保留预处理能力，供 PatchCore 数据准备复用）：
   - 使用 function_bank.split_multi_strips 切带
   - 按条带竖直分段，输出到 CAMx/train/good/
 
@@ -34,7 +34,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from app.common.function_bank import split_multi_strips as fb_split_multi_strips
+from function_bank import split_multi_strips as fb_split_multi_strips
 from det_model.infer import apply_fft_deripple, apply_vertical_filter
 
 

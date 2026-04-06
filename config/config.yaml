@@ -3,6 +3,27 @@ debug_io: false
 # 速度测试：终端汇总间隔（秒）。各相机接收fps/处理fps/队列/分阶段耗时；可改为 1.0 更密
 speed_report_interval_sec: 5.0
 
+# 产线静止追平：界面判定「静止」且检测未暂停时，worker 在一轮 get 后连续消化队列（给推理腾时间）
+# line_idle_stale_sec：距 line_heartbeat.json 收图时间超过该秒数视为静止，才触发追平
+# line_idle_catchup_max_frames：单次最多连处理帧数，避免长时间占用 worker
+line_idle_catchup_enable: true
+line_idle_stale_sec: 2.0
+line_idle_catchup_max_frames: 40
+
+# 主界面「缺陷位置 + 幅宽」共用长度窗口（检测滞后时可加大窗口与回溯）
+ui_defect_window_target_m: 30.0
+ui_defect_window_max_mm: 300000
+ui_defect_backtrack_max_mm: 150000
+ui_defect_lag_margin_mm: 20000
+# 缺陷坐标 JSON 轮询间隔（毫秒）；积压大时线程内会提高单次读取条数
+ui_defect_coord_poll_ms: 500
+# 长度轴非线性：将尾部一段物理区间压到更少像素（false 则全程线性）
+ui_defect_axis_nonlinear: false
+# 窗口右端尾部占物理窗口长度的比例（与非线性配合）
+ui_defect_axis_tail_phys_ratio: 0.35
+# 尾部在上述物理比例内时，占用横轴像素宽度的比例（越小尾部越「挤」）
+ui_defect_axis_tail_pixel_ratio: 0.2
+
 Consecutive_Check: 0
 Consecutive_thres_num: 30
 anomaly_area_cls_range:
@@ -37,7 +58,7 @@ cam1_patchcore_edge_soft_border: 50
 cam1_patchcore_edge_strength: 0.5
 cam1_patchcore_edge_weight_profile: ease_out_cubic
 cam1_standard_ratio_x: 0.4308
-cam1_times: 0.865127
+cam1_times: 0.858658
 cam2_cut_ratio: 3
 cam2_img_size: 256
 cam2_draem_seg_anomaly_thres: 0.004
@@ -53,7 +74,7 @@ cam2_patchcore_edge_soft_border: 100
 cam2_patchcore_edge_strength: 1
 cam2_patchcore_edge_weight_profile: ease_out_cubic
 cam2_standard_ratio_x: 0.4578
-cam2_times: 0.8121726
+cam2_times: 0.8080166
 cam3_cut_ratio: 3
 cam3_img_size: 256
 cam3_draem_seg_anomaly_thres: 0.004
@@ -68,8 +89,8 @@ cam3_diff_threshold: 0.3
 cam3_patchcore_edge_soft_border: 100
 cam3_patchcore_edge_strength: 1
 cam3_patchcore_edge_weight_profile: ease_out_cubic
-cam3_standard_ratio_x: 0.4368
-cam3_times: 0.842561
+cam3_standard_ratio_x: 0.4578
+cam3_times: 0.8080166
 cam4_cut_ratio: 3
 cam4_img_size: 256
 cam4_draem_seg_anomaly_thres: 0.004

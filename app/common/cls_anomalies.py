@@ -1,11 +1,11 @@
 import time
 import os
-_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 import yaml
-from app.common.cls_model import ProjectionNet
+from cls_model import ProjectionNet
 import torch
 from pathlib import Path
-from app.common.function_bank import Anomaly_info_List, find_folders_with_id
+from function_bank import Anomaly_info_List,find_folders_with_id
 import json
 import torchvision.transforms as transforms
 import glob
@@ -14,6 +14,8 @@ from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 from collections import defaultdict
+import warnings
+import json
 
 class ImageDataset(Dataset):
     """ dataset name."""
@@ -73,6 +75,17 @@ def cls_anomalies(model_path, result_all_path, camrea_id, multi_strip=False):
         strip_paths = [cam_dir]
 
     # === Step 2. 加载模型 ===
+    # torchvision 新版对 pretrained 参数会产生弃用警告，这里统一忽略，避免报告中心终端刷屏
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*parameter 'pretrained' is deprecated.*",
+        category=UserWarning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*Arguments other than a weight enum.*for 'weights' are deprecated.*",
+        category=UserWarning,
+    )
     head_layers = [512] * 1 + [128]
     weights = torch.load(model_path, map_location=device)
     # raw = torch.load(model_path, map_location="cpu")
@@ -87,6 +100,21 @@ def cls_anomalies(model_path, result_all_path, camrea_id, multi_strip=False):
     model.load_state_dict(weights)
     model = model.to(device)
     model.eval()
+
+    # === Step 2.5 读取“模型输出->报告类别ID”的对齐映射（可选）===
+    # 用于：模型类别顺序与 rptcfg.class_labels 顺序不一致时，仍能写出正确的 1-based 类别编号。
+    remap_modelidx_to_rptid = None
+    try:
+        runtime_state_path = os.path.join(os.path.dirname(__file__), "config", "runtime_state.json")
+        if os.path.exists(runtime_state_path):
+            with open(runtime_state_path, "r", encoding="utf-8") as f:
+                st = json.load(f) or {}
+            if str(st.get("cls_model_path", "") or "").strip() == str(model_path or "").strip():
+                rr = st.get("cls_label_remap_modelidx_to_rptid_1based")
+                if isinstance(rr, list) and len(rr) == int(classes):
+                    remap_modelidx_to_rptid = [int(x) for x in rr]
+    except Exception:
+        remap_modelidx_to_rptid = None
 
     # === Step 3. 遍历每条带钢进行分类 ===
     for strip_path in strip_paths:
@@ -119,7 +147,17 @@ def cls_anomalies(model_path, result_all_path, camrea_id, multi_strip=False):
 
         logits = torch.stack(logits)
         predict_cla = torch.argmax(logits, axis=1).tolist()
-        anomalies_info = [[f"{a}_{b}" for a, b in zip(predict_cla, coords_list)]]
+        # 报告与 rptcfg 使用 1-based 类别编号（1..N）。
+        # 默认：模型 argmax 为 0-based，写盘前 +1；
+        # 若存在 remap（模型类别顺序与 rptcfg 不同），则按 remap 把 0-based 映射到 rptcfg 的 1-based id。
+        if isinstance(remap_modelidx_to_rptid, list) and remap_modelidx_to_rptid:
+            predict_cla_report = [
+                int(remap_modelidx_to_rptid[int(c)]) if 0 <= int(c) < len(remap_modelidx_to_rptid) else int(c) + 1
+                for c in predict_cla
+            ]
+        else:
+            predict_cla_report = [int(c) + 1 for c in predict_cla]
+        anomalies_info = [[f"{a}_{b}" for a, b in zip(predict_cla_report, coords_list)]]
 
         # === Step 4. 保存分类结果 ===
         result_cls_path = strip_path

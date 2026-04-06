@@ -3,7 +3,7 @@ area_range : []
 steel_length_range: []
 class_list : [1,2,3,4] #总共的类别
 class_labels : {
-            1: "划痕",
+            1: "破洞",
             2: "擦伤",
             3: "污点",
             4: "穿孔",
@@ -20,7 +20,7 @@ updates_down: [{"class_label": "污点", "area_interval": "> 100", "new_count": 
 
 
 
-colors : {"划痕": '#FF6347',  # Tomato（红色）
+colors : {"破洞": '#FF6347',  # Tomato（红色）
             "擦伤": '#4682B4',  # SteelBlue（蓝色）
             "污点": '#32CD32',  # LimeGreen（绿色）
             "穿孔": '#FFD700'  # Gold（黄色）

@@ -4,3 +4,4 @@
 passwords:
   standard_report: "000"      # 报告打印与标准维护（「报告打印」入口）
   parameter_settings: "000"   # 参数设置
+  cls_config: "000"           # 类别配置（主界面 / 报告相关入口）

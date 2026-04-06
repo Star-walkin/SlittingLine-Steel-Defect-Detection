@@ -1,23 +1,43 @@
 area_range: []
 check_cls: '1'
 class_labels:
-  1: 划痕
+  1: 破洞
   2: 擦伤
-  3: 破洞
+  3: 污渍
+  4: 划伤
+  5: 拉伤起皮
+class_labels_by_product:
+  '1':
+    1: 破洞
+    2: 擦伤
+    3: 污渍
+  '4':
+    1: 破洞
+    2: 擦伤
+    3: 污渍
+    4: 划伤
 class_list:
 - 1
 - 2
 - 3
+cls_model_by_product:
+  '1':
+    model_path: cls_model\cls_checkpoint.pth
+    remap_modelidx_to_rptid_1based:
+    - 1
+    - 2
+    - 3
+    source: current
+    trained_at: '2026-04-02 12:00:00'
 colors:
-  划痕: '#FF6347'
   擦伤: '#4682B4'
-  污点: '#32CD32'
-  穿孔: '#FFD700'
+  污渍: '#32CD32'
+  破洞: '#FF6347'
 data1:
 - - 2000
   - 7000
   - 100
-  - 20
+  - 100
   - 100
   - 100
 - - 10000
@@ -51,6 +71,12 @@ data2:
   - 100
   - 100
   - 100
+- - 1000
+  - 1000
+  - 1000
+  - 1000
+  - 1000
+  - 1000
 data3:
 - - 200
   - 7000
@@ -89,17 +115,132 @@ data4:
   - 1000
   - 1000
   - 1000
-id: '03'
+id: '01'
 print_cls:
 - 1
 - 2
 - 3
-product_cls: '1'
+- 4
+- 5
+product_cls: '4'
 product_cls_names:
-  '4': 带钢
+  '1': 316L
+  '2': '301'
+  '4': '304'
+rptcfg_revision: 258
+rptcfg_updated_at: '2026-04-06 12:03:06'
+rptcfg_updated_by: DESKTOP-NSH13CD
 steel_length_range: []
 strip_id: '1'
-time: '20260330'
+time: '20260402'
 update_info: false
-updates_down: []
-updates_up: []
+updates_down:
+- area_interval: '[0, 20]'
+  class_label: 破洞
+  new_count: 0
+- area_interval: '[20, 40]'
+  class_label: 破洞
+  new_count: 0
+- area_interval: '[40, 60]'
+  class_label: 破洞
+  new_count: 0
+- area_interval: '[60, 80]'
+  class_label: 破洞
+  new_count: 0
+- area_interval: '[80, 100]'
+  class_label: 破洞
+  new_count: 0
+- area_interval: '> 100'
+  class_label: 破洞
+  new_count: 0
+- area_interval: '[0, 20]'
+  class_label: 擦伤
+  new_count: 0
+- area_interval: '[20, 40]'
+  class_label: 擦伤
+  new_count: 0
+- area_interval: '[40, 60]'
+  class_label: 擦伤
+  new_count: 0
+- area_interval: '[60, 80]'
+  class_label: 擦伤
+  new_count: 0
+- area_interval: '[80, 100]'
+  class_label: 擦伤
+  new_count: 0
+- area_interval: '> 100'
+  class_label: 擦伤
+  new_count: 0
+- area_interval: '[0, 20]'
+  class_label: 污渍
+  new_count: 0
+- area_interval: '[20, 40]'
+  class_label: 污渍
+  new_count: 0
+- area_interval: '[40, 60]'
+  class_label: 污渍
+  new_count: 0
+- area_interval: '[60, 80]'
+  class_label: 污渍
+  new_count: 0
+- area_interval: '[80, 100]'
+  class_label: 污渍
+  new_count: 0
+- area_interval: '> 100'
+  class_label: 污渍
+  new_count: 0
+updates_up:
+- area_interval: '[0, 20]'
+  class_label: 破洞
+  new_count: 0
+- area_interval: '[20, 40]'
+  class_label: 破洞
+  new_count: 0
+- area_interval: '[40, 60]'
+  class_label: 破洞
+  new_count: 0
+- area_interval: '[60, 80]'
+  class_label: 破洞
+  new_count: 0
+- area_interval: '[80, 100]'
+  class_label: 破洞
+  new_count: 0
+- area_interval: '> 100'
+  class_label: 破洞
+  new_count: 0
+- area_interval: '[0, 20]'
+  class_label: 擦伤
+  new_count: 0
+- area_interval: '[20, 40]'
+  class_label: 擦伤
+  new_count: 5
+- area_interval: '[40, 60]'
+  class_label: 擦伤
+  new_count: 0
+- area_interval: '[60, 80]'
+  class_label: 擦伤
+  new_count: 0
+- area_interval: '[80, 100]'
+  class_label: 擦伤
+  new_count: 0
+- area_interval: '> 100'
+  class_label: 擦伤
+  new_count: 0
+- area_interval: '[0, 20]'
+  class_label: 污渍
+  new_count: 0
+- area_interval: '[20, 40]'
+  class_label: 污渍
+  new_count: 0
+- area_interval: '[40, 60]'
+  class_label: 污渍
+  new_count: 0
+- area_interval: '[60, 80]'
+  class_label: 污渍
+  new_count: 0
+- area_interval: '[80, 100]'
+  class_label: 污渍
+  new_count: 0
+- area_interval: '> 100'
+  class_label: 污渍
+  new_count: 0

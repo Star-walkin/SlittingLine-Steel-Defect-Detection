@@ -9,7 +9,7 @@
 
 
 import os
-_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 
@@ -328,13 +328,13 @@ class Ui_Report(object):
         _translate = QtCore.QCoreApplication.translate
         Report.setWindowTitle(_translate("Report", "Report"))
         self.label.setText(_translate("Report", "缺陷类别："))
-        self.label_4.setText(_translate("Report", "生产卡号"))
+        self.label_4.setText(_translate("Report", "质保书号"))
         self.label_2.setText(_translate("Report", "选择报告："))
         self.label_3.setText(_translate("Report", "日期"))
         self.pushButton_id.setText(_translate("Report", "确认"))
         self.label_5.setText(_translate("Report", "已选择："))
         self.label_13.setText(_translate("Report", "类别"))
-        self.label_14.setText(_translate("Report", "钢带号"))
+        self.label_14.setText(_translate("Report", "带钢卡号"))
         self.label_6.setText(_translate("Report", "合格标准："))
         self.label_7.setText(_translate("Report", "优化选项："))
         self.standard_save.setText(_translate("Report", "保存"))
