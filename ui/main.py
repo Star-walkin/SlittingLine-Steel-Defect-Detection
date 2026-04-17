@@ -180,7 +180,8 @@ def _apply_app_theme(app: QtWidgets.QApplication) -> None:
 
 class WaveformThread(QThread):
     # data, has_abnormal, detection_system_index, last_measured_mm, tail_narrow_streak
-    update_signal = pyqtSignal(list, bool, int, float, int)
+    # meta: dict from fukuan_meta.json last entry (may be None)
+    update_signal = pyqtSignal(list, bool, int, float, int, object)
 
     def __init__(self, camid, detection_system_index):
         super(WaveformThread, self).__init__()
@@ -247,6 +248,24 @@ class WaveformThread(QThread):
 
         return folder_path
 
+    @staticmethod
+    def _cam_folder_name_from_id(camid):
+        """
+        目录命名统一：
+        - camid=2 -> 上表面
+        - camid=3 -> 下表面
+        其余保持原数字目录（兼容旧结构）
+        """
+        try:
+            c = int(camid)
+        except Exception:
+            return str(camid)
+        if c == 2:
+            return "上表面"
+        if c == 3:
+            return "下表面"
+        return str(c)
+
     def read_json_data(self, file_path):
         # Windows 下写端与读端并发时，可能短暂读到“空/半截 JSON”
         # 这里做短重试，避免 UI 因竞争导致长期显示缺失
@@ -272,7 +291,7 @@ class WaveformThread(QThread):
             baseline_width = config0.get(fukuan_key, 0)
 
             if baseline_width <= 0:
-                self.update_signal.emit([], False, self.detection_system_index, float("nan"), 0)
+                self.update_signal.emit([], False, self.detection_system_index, float("nan"), 0, None)
                 return
 
             id = config0['conduct_id']
@@ -282,7 +301,8 @@ class WaveformThread(QThread):
                 return
 
             root_path = found_folders[0]
-            self.fukuan_path = root_path + "/" + str(self.camid) + "/" + "strip_" + str(
+            cam_folder = self._cam_folder_name_from_id(self.camid)
+            self.fukuan_path = root_path + "/" + str(cam_folder) + "/" + "strip_" + str(
                 self.detection_system_index) + "/"
             new_folder_name = "fukuan.json"
 
@@ -309,13 +329,26 @@ class WaveformThread(QThread):
                     has_abnormal, last_mm, tail_streak = self._analyze_fukuan_series(
                         new_data, baseline_width
                     )
+                    last_meta = None
+                    try:
+                        meta_path = os.path.join(self.fukuan_path, "fukuan_meta.json")
+                        meta_data = self.read_json_data(meta_path)
+                        if isinstance(meta_data, list) and meta_data:
+                            last_meta = meta_data[-1]
+                    except Exception:
+                        last_meta = None
                     self.update_signal.emit(
-                        new_data, has_abnormal, self.detection_system_index, last_mm, tail_streak
+                        new_data,
+                        has_abnormal,
+                        self.detection_system_index,
+                        last_mm,
+                        tail_streak,
+                        last_meta,
                     )
 
         except Exception as e:
             print(f"检测系统{self.detection_system_index}读取数据失败: {e}")
-            self.update_signal.emit([], False, self.detection_system_index, float("nan"), 0)
+            self.update_signal.emit([], False, self.detection_system_index, float("nan"), 0, None)
 
     def stop(self):
         self._is_running = False
@@ -345,6 +378,11 @@ class ImageLoaderThread(QThread):
         self.last_fukuan_mtime = 0
         self.last_fukuan_file_path = None
         self.fukuan_fallback = 0.0
+        # JSONL 追尾读取状态
+        self._jsonl_offset = 0
+        self._jsonl_partial = ""
+        self._jsonl_path = None
+        self._jsonl_last_size = 0
 
     def run(self):
         poll_ms = 500
@@ -382,8 +420,33 @@ class ImageLoaderThread(QThread):
 
         return folder_path
 
+    @staticmethod
+    def _cam_folder_name_from_id(camid):
+        """同 WaveformThread：camid=2/3 映射为 上表面/下表面。"""
+        try:
+            c = int(camid)
+        except Exception:
+            return str(camid)
+        if c == 2:
+            return "上表面"
+        if c == 3:
+            return "下表面"
+        return str(c)
+
     def read_coordinates(self):
         try:
+            # UI 读取来源开关（默认 jsonl）
+            ui_coord_source = "jsonl"
+            max_lines = 200
+            try:
+                with open(os.path.join(_REPO_ROOT, "config", "config.yaml"), "r", encoding="utf-8") as _cf:
+                    _cfg = yaml.safe_load(_cf) or {}
+                ui_coord_source = str(_cfg.get("ui_coord_source", "jsonl") or "jsonl").lower()
+                max_lines = int(_cfg.get("ui_coord_max_lines_per_tick", 200) or 200)
+            except Exception:
+                pass
+            max_lines = max(10, min(max_lines, 2000))
+
             # 1. 读取配置
             with open(os.path.join(_REPO_ROOT, 'config', 'config0.yaml'), 'r', encoding='utf-8') as file:
                 config0 = yaml.safe_load(file)
@@ -401,7 +464,8 @@ class ImageLoaderThread(QThread):
                 return
 
             root_path = found_folders[0]
-            self.folder_path = root_path + "/" + str(self.camid) + "/" + "strip_" + str(
+            cam_folder = self._cam_folder_name_from_id(self.camid)
+            self.folder_path = root_path + "/" + str(cam_folder) + "/" + "strip_" + str(
                 self.detection_system_index) + "/"
             new_folder_name = "defect_images"
             self.base_folder = os.path.join(self.folder_path, new_folder_name)
@@ -409,6 +473,7 @@ class ImageLoaderThread(QThread):
             # 目标坐标文件路径
             coord_file_path = os.path.join(self.folder_path, "image_anomaly_center.json")
             self.fukuan_file_path = os.path.join(self.folder_path, "fukuan.json")
+            jsonl_path = os.path.join(self.folder_path, "defect_events_center.jsonl")
 
             if not os.path.exists(coord_file_path):
                 return
@@ -436,6 +501,83 @@ class ImageLoaderThread(QThread):
             except Exception:
                 # 幅宽读取失败不影响坐标显示，退回到 fallback
                 self.fukuan_data = []
+
+            # ======================
+            # JSONL 追尾读取（推荐）
+            # ======================
+            if ui_coord_source == "jsonl" and os.path.exists(jsonl_path):
+                # 文件切换/轮转/截断：offset 归零
+                if self._jsonl_path != jsonl_path:
+                    self._jsonl_path = jsonl_path
+                    self._jsonl_offset = 0
+                    self._jsonl_partial = ""
+                    self._jsonl_last_size = 0
+                try:
+                    cur_size = os.path.getsize(jsonl_path)
+                    if cur_size < self._jsonl_offset:
+                        # 被轮转或截断
+                        self._jsonl_offset = 0
+                        self._jsonl_partial = ""
+                    if cur_size == self._jsonl_offset:
+                        return
+                    with open(jsonl_path, "r", encoding="utf-8") as fr:
+                        fr.seek(self._jsonl_offset)
+                        chunk = fr.read()
+                        self._jsonl_offset = fr.tell()
+                except Exception:
+                    return
+
+                buf = (self._jsonl_partial or "") + (chunk or "")
+                lines = buf.split("\n")
+                # 最后一行可能是半截，留到下次
+                self._jsonl_partial = lines[-1]
+                ready = lines[:-1]
+                if not ready:
+                    return
+
+                processed = 0
+                for ln in ready:
+                    if processed >= max_lines:
+                        break
+                    s = (ln or "").strip()
+                    if not s:
+                        continue
+                    try:
+                        ev = json.loads(s)
+                    except Exception:
+                        continue
+                    pts = ev.get("points", [])
+                    if not isinstance(pts, list) or not pts:
+                        continue
+                    # 每行可能包含多个点；按点 emit（保持现有 UI 缓存/按钮逻辑不变）
+                    for p in pts:
+                        if processed >= max_lines:
+                            break
+                        try:
+                            x, y = p
+                            x = float(x); y = float(y)
+                        except Exception:
+                            continue
+                        current_multiple = int(y // 1720)
+                        # 根据长度段索引选择对应幅宽（Stable fukuan.json）
+                        fukuan_for_point = self.fukuan_fallback
+                        idx0 = current_multiple - 1
+                        if 0 <= idx0 < len(self.fukuan_data):
+                            fukuan_for_point = self.fukuan_data[idx0]
+                        elif 0 <= current_multiple < len(self.fukuan_data):
+                            fukuan_for_point = self.fukuan_data[current_multiple]
+                        self.position += 1
+                        self.image_loaded.emit(
+                            x,
+                            y,
+                            current_multiple,
+                            self.position,
+                            float(fukuan_for_point) if fukuan_for_point else float(self.fukuan_fallback),
+                            self.base_folder,
+                            self.detection_system_index,
+                        )
+                        processed += 1
+                return
 
             # 调试打印 (仅在路径变更时显示一次)
             if coord_file_path != self.last_file_path:
@@ -565,6 +707,11 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.abnormal_status = [False] * self.MAX_STRIPS
         self.fukuan_last_measured = [float("nan")] * self.MAX_STRIPS
         self.fukuan_tail_narrow = [0] * self.MAX_STRIPS
+        # 幅宽双轨/保护信息（Stable 显示 + Raw 追溯）
+        self.fukuan_last_raw = [float("nan")] * self.MAX_STRIPS
+        self.fukuan_last_valid = [True] * self.MAX_STRIPS
+        self.fukuan_last_reason = [""] * self.MAX_STRIPS
+        self.fukuan_last_mode = [""] * self.MAX_STRIPS
         self.display_end_indices = [0 for _ in range(self.MAX_STRIPS)]
         # 浮点游标：平滑追赶最新数据长度，避免整档跳跃
         self.display_smooth_end = [0.0 for _ in range(self.MAX_STRIPS)]
@@ -606,6 +753,11 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         # 初始：未确认配置时不允许开始/暂停
         try:
             self._refresh_start_stop_enabled()
+        except Exception:
+            pass
+        # 初始：仅在“暂停态（未运行）”允许换卷
+        try:
+            self._refresh_exchange_enabled()
         except Exception:
             pass
 
@@ -730,7 +882,17 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             lbl.setToolTip(tip)
 
     def _format_fukuan_status_richtext(
-        self, baseline, last_mm, tail_streak, has_alarm, active, has_waveform_points
+        self,
+        baseline,
+        last_mm,
+        tail_streak,
+        has_alarm,
+        active,
+        has_waveform_points,
+        protected=False,
+        raw_mm=None,
+        mode=None,
+        reason=None,
     ):
         """生成右侧状态面板 HTML。"""
         if not active:
@@ -753,6 +915,20 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         else:
             pct_txt = ""
         sub_lines = []
+        if protected:
+            try:
+                raw_txt = f"{float(raw_mm):.1f}" if raw_mm is not None and float(raw_mm) == float(raw_mm) else "NaN"
+            except Exception:
+                raw_txt = "NaN"
+            m = str(mode or "")
+            r = str(reason or "")
+            hint = f"本帧测量异常已保护（Raw={raw_txt}mm"
+            if m:
+                hint += f"，mode={m}"
+            if r:
+                hint += f"，reason={r}"
+            hint += "）"
+            sub_lines.append(hint)
         narrow = fukuan_is_significantly_narrow(last_mm, baseline)
         if has_alarm:
             tier = "报警"
@@ -773,7 +949,11 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         else:
             tier = "正常"
             tier_color = "#1e8449"
-        extra = f"<br/><span style='font-size:9px;color:#566573'>{sub_lines[0]}</span>" if sub_lines else ""
+        extra = ""
+        if sub_lines:
+            extra = "<br/>" + "<br/>".join(
+                [f"<span style='font-size:9px;color:#566573'>{s}</span>" for s in sub_lines[:2]]
+            )
         return (
             f'<span style="color:{tier_color};font-size:12px;"><b>{tier}</b></span><br/>'
             f'<span style="color:#2c3e50;font-size:10px;">'
@@ -1528,6 +1708,22 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                 "检测处于运行状态时不能换卷。请先点击「暂停」停止界面刷新后，再执行换卷。",
             )
             return
+        # 兜底：确保界面刷新定时器停下（理论上暂停按钮已做，但这里防竞态/误触发）
+        try:
+            if getattr(self, "render_timer", None) is not None:
+                self.render_timer.stop()
+        except Exception:
+            pass
+        # 换卷开始：先禁用按钮防止重复点击
+        try:
+            self.button_exchange.setEnabled(False)
+        except Exception:
+            pass
+        # 换卷属于“跨卷重置”，进入前先清空全部视觉区，避免残留上一卷画面/按钮/刻度
+        try:
+            self._clear_all_visuals()
+        except Exception:
+            pass
         self.conduct_id.clear()
         self.fukuan_1.clear()  # 清空第一个检测系统幅宽输入框
         self.fukuan_2.clear()  # 清空第二个检测系统幅宽输入框
@@ -1597,6 +1793,12 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             except Exception:
                 pass
 
+            # 换卷：强制重启 Python 接收端，确保新一卷从零开始
+            try:
+                self._restart_python_receiver_for_roll_change()
+            except Exception:
+                pass
+
             QMessageBox.information(self, "输入信息",
                                     "已清空配置，请输入：\n"
                                     "• 质保书号\n"
@@ -1606,10 +1808,17 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             try:
                 self._confirmed_this_session = False
                 self._refresh_start_stop_enabled()
+                self._refresh_exchange_enabled()
             except Exception:
                 pass
         except Exception as e:
             QMessageBox.warning(self, "重置失败", f"重置配置文件时出错: {str(e)}")
+        finally:
+            # 换卷结束：由 _refresh_exchange_enabled 按运行态恢复可交互性
+            try:
+                self._refresh_exchange_enabled()
+            except Exception:
+                pass
 
     def save_config01(self):#通过界面输入创建configu文件并保存
         try:
@@ -1776,6 +1985,160 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             pass
         try:
             self.pushButton_stop.setEnabled(bool(ok))
+        except Exception:
+            pass
+
+    def _refresh_exchange_enabled(self):
+        """
+        换卷按钮仅在“暂停态（未运行）”可交互。
+        注意：换卷与“确认配置”无关；它只受运行态与后端进程切换期影响。
+        """
+        try:
+            # 运行中不允许换卷（核心约束）
+            enabled = not bool(getattr(self, "_ui_detection_running", False))
+
+            # 进程处于启动/退出切换期时也禁用，避免竞态（尽量保守）
+            proc = getattr(self, "python_process", None)
+            if proc is not None:
+                try:
+                    st = proc.state()
+                    if st == QProcess.Starting:
+                        enabled = False
+                except Exception:
+                    pass
+
+            self.button_exchange.setEnabled(bool(enabled))
+        except Exception:
+            pass
+
+    def _clear_all_visuals(self):
+        """换卷时一次性清空所有视觉区，避免残留上一卷的任何图像/红点/刻度/曲线。"""
+        # 1) 清空缺陷红点按钮（上/下表面）
+        try:
+            for i in range(self.MAX_STRIPS):
+                try:
+                    self.refresh_buttons(i)
+                except Exception:
+                    # refresh_buttons 内部已兜底，这里再兜底一次
+                    self.buttons[i] = []
+                try:
+                    self.refresh_buttons2(i)
+                except Exception:
+                    self.buttons2[i] = []
+        except Exception:
+            pass
+
+    def _restart_python_receiver_for_roll_change(self):
+        """
+        换卷专用：强制重启 Python 接收端，确保新一卷从“全新会话”开始。
+        注意：这与“暂停/继续”不同；普通暂停不应杀进程。
+        """
+        # 换卷后应保持 paused=True，直到用户重新确认并点击开始
+        try:
+            _write_runtime_state(paused=True)
+        except Exception:
+            pass
+
+        proc = getattr(self, "python_process", None)
+        if proc is None:
+            return
+        try:
+            if proc.state() != QProcess.NotRunning:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                try:
+                    proc.waitForFinished(1500)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            self.python_process = None
+        except Exception:
+            pass
+        try:
+            self._refresh_exchange_enabled()
+        except Exception:
+            pass
+
+        # 2) 清空缺陷分布主图（label_up_show / label_down_show）
+        try:
+            for lb in (self._up_show_labels() + self._down_show_labels()):
+                if lb is None:
+                    continue
+                try:
+                    lb.clear()
+                    lb.setPixmap(QPixmap())
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # 3) 清空实时小图与细节图（*_1 与 *_2）
+        try:
+            for lb in (
+                self._up_realtime_labels()
+                + self._down_realtime_labels()
+                + self._up_click_labels()
+                + self._down_click_labels()
+            ):
+                if lb is None:
+                    continue
+                try:
+                    lb.clear()
+                    lb.setPixmap(QPixmap())
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # 4) 清空缺陷分布外置刻度轴
+        try:
+            for ax in (list(getattr(self, "up_axis_left", []))
+                       + list(getattr(self, "up_axis_bottom", []))
+                       + list(getattr(self, "down_axis_left", []))
+                       + list(getattr(self, "down_axis_bottom", []))):
+                if ax is None:
+                    continue
+                try:
+                    ax.clear()
+                    ax.setPixmap(QPixmap())
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # 5) 清空幅宽曲线与其外置坐标轴
+        try:
+            for i in range(self.MAX_STRIPS):
+                host = None
+                try:
+                    host = self._fukuan_labels()[i]
+                except Exception:
+                    host = None
+                if host is not None:
+                    try:
+                        host.clear()
+                        host.setPixmap(QPixmap())
+                    except Exception:
+                        pass
+                axl = None
+                axb = None
+                try:
+                    axl = self.fukuan_axis_left_labels[i]
+                    axb = self.fukuan_axis_bottom_labels[i]
+                except Exception:
+                    axl, axb = None, None
+                for ax in (axl, axb):
+                    if ax is None:
+                        continue
+                    try:
+                        ax.clear()
+                        ax.setPixmap(QPixmap())
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -2156,6 +2519,10 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             self._apply_detect_state_style(running)
         except Exception:
             pass
+        try:
+            self._refresh_exchange_enabled()
+        except Exception:
+            pass
 
     def _refresh_line_state(self) -> None:
         """产线状态：若最近一段时间收到图片 => 运行，否则静止。"""
@@ -2276,13 +2643,25 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         msg_box.show()  # 非阻塞显示
         return msg_box  # 返回消息框对象（如果需要进一步操作）
 
-    def plot_waveform(self, data, has_abnormal, detection_system_index, last_mm, tail_streak):
+    def plot_waveform(self, data, has_abnormal, detection_system_index, last_mm, tail_streak, meta):
         try:
             system_index = detection_system_index - 1
             self.total_data[system_index] = data
             self.abnormal_status[system_index] = has_abnormal
             self.fukuan_last_measured[system_index] = last_mm
             self.fukuan_tail_narrow[system_index] = tail_streak
+            # meta: 由检测端输出（Raw/Stable/来源/原因）
+            if isinstance(meta, dict):
+                try:
+                    self.fukuan_last_raw[system_index] = float(meta.get("raw")) if meta.get("raw") is not None else float("nan")
+                except Exception:
+                    self.fukuan_last_raw[system_index] = float("nan")
+                try:
+                    self.fukuan_last_valid[system_index] = bool(meta.get("valid", True))
+                except Exception:
+                    self.fukuan_last_valid[system_index] = True
+                self.fukuan_last_reason[system_index] = str(meta.get("reason", "") or "")
+                self.fukuan_last_mode[system_index] = str(meta.get("mode", "") or "")
         except Exception as e:
             print(f"plot_waveform系统{detection_system_index}发生错误：{e}")
 
@@ -2419,6 +2798,10 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                                 self.abnormal_status[system_index],
                                 True,
                                 total_len >= 2,
+                                protected=(not bool(self.fukuan_last_valid[system_index])),
+                                raw_mm=self.fukuan_last_raw[system_index],
+                                mode=self.fukuan_last_mode[system_index],
+                                reason=self.fukuan_last_reason[system_index],
                             )
                         )
                         total_len_ok = False
@@ -2589,6 +2972,10 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                         self.abnormal_status[system_index],
                         True,
                         total_len >= 2,
+                        protected=(not bool(self.fukuan_last_valid[system_index])),
+                        raw_mm=self.fukuan_last_raw[system_index],
+                        mode=self.fukuan_last_mode[system_index],
+                        reason=self.fukuan_last_reason[system_index],
                     )
                 )
 

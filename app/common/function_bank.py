@@ -3025,7 +3025,8 @@ def _split_4strip_by_gradient(gray_img, fukuan_list_mm, standard_ratio_x=1.0,
 def split_multi_strips(img, fukuan_list_mm=None, standard_ratio_x=1,
                        min_peak_dist_px=30, search_margin_ratio=0.1,
                        use_thumbnail=False, positioning_method="detrend",
-                       detrend_sigma=100, morph_closing=True, cam_id=None):
+                       detrend_sigma=100, morph_closing=True, cam_id=None,
+                       return_mode: bool = False):
     """
     条带切分。在列投影前增加“定位用”预处理，抗光照不均与背景纹理。
     cam_id: 相机 ID（0=cam1, 1=cam2 明场, 2=cam3 暗场, 3=cam4）。
@@ -3037,6 +3038,7 @@ def split_multi_strips(img, fukuan_list_mm=None, standard_ratio_x=1,
     if fukuan_list_mm is None:
         fukuan_list_mm = [400, 400, 400]
     num_strips = len(fukuan_list_mm)
+    mode = "unknown"
 
     # ---------- 单条：列投影定位钢区（非仅靠四角 fine_trim，避免黑底很宽时退回整幅）----------
     if num_strips == 1:
@@ -3056,11 +3058,13 @@ def split_multi_strips(img, fukuan_list_mm=None, standard_ratio_x=1,
             min_strip_width_px=min_w_px,
         )
         if splits_1d is not None and len(splits_1d) == 1:
+            mode = "primary_gradient_1"
             L, R = splits_1d[0]
             L = max(0, min(int(L), full_W - 2))
             R = max(L + 2, min(int(R), full_W))
             final_L, final_R = L, R
         else:
+            mode = "fallback_fine_trim_1"
             em = max(full_W // 4, min(600, full_W // 2))
             final_L, final_R = _fine_trim_strip_v2(img, edge_margin=em)
             if final_R <= final_L + min_w_px:
@@ -3068,6 +3072,8 @@ def split_multi_strips(img, fukuan_list_mm=None, standard_ratio_x=1,
         refined_splits = [(final_L, final_R)]
         refined_strips = [img[:, final_L:final_R]]
         measured_mm = [float((final_R - final_L) * standard_ratio_x)]
+        if return_mode:
+            return refined_strips, measured_mm, refined_splits, mode
         return refined_strips, measured_mm, refined_splits
 
     if img.ndim == 3:
@@ -3100,6 +3106,7 @@ def split_multi_strips(img, fukuan_list_mm=None, standard_ratio_x=1,
     min_w_px = max(50, W // 80)
 
     splits_1d = None
+    used_primary = False
 
     # ---------- 2/3/4 条：Otsu 垂直投影 + 外缘幅宽比 + 梯度精修（须用 gray_raw_loc） ----------
     if num_strips == 2:
@@ -3109,6 +3116,9 @@ def split_multi_strips(img, fukuan_list_mm=None, standard_ratio_x=1,
             standard_ratio_x=standard_ratio_x,
             min_strip_width_px=min_w_px,
         )
+        if splits_1d is not None and len(splits_1d) == 2:
+            used_primary = True
+            mode = "primary_gradient_2"
     elif num_strips == 3:
         splits_1d = _split_3strip_by_gradient(
             gray_raw_loc,
@@ -3116,6 +3126,9 @@ def split_multi_strips(img, fukuan_list_mm=None, standard_ratio_x=1,
             standard_ratio_x=standard_ratio_x,
             min_strip_width_px=min_w_px,
         )
+        if splits_1d is not None and len(splits_1d) == 3:
+            used_primary = True
+            mode = "primary_gradient_3"
     elif num_strips == 4:
         splits_1d = _split_4strip_by_gradient(
             gray_raw_loc,
@@ -3123,6 +3136,9 @@ def split_multi_strips(img, fukuan_list_mm=None, standard_ratio_x=1,
             standard_ratio_x=standard_ratio_x,
             min_strip_width_px=min_w_px,
         )
+        if splits_1d is not None and len(splits_1d) == 4:
+            used_primary = True
+            mode = "primary_gradient_4"
 
     # ---------- 上述失败或其它条数：走双轨算法（同样用原始图） ----------
     if splits_1d is None or len(splits_1d) != num_strips:
@@ -3130,10 +3146,14 @@ def split_multi_strips(img, fukuan_list_mm=None, standard_ratio_x=1,
             splits_1d = _split_bright_field_1d(
                 gray_raw_loc, num_strips=num_strips, min_strip_width_px=min_w_px
             )
+            if splits_1d is not None and len(splits_1d) == num_strips:
+                mode = "fallback_bright_field"
         else:
             splits_1d = _split_dark_field_1d(
                 gray_raw_loc, num_strips=num_strips, min_strip_width_px=min_w_px
             )
+            if splits_1d is not None and len(splits_1d) == num_strips:
+                mode = "fallback_dark_field"
 
     # ---------- 仍然失败：三条走谷值+导数旧算法（可接受拍平图），否则均分 ----------
     if splits_1d is None or len(splits_1d) != num_strips:
@@ -3141,8 +3161,11 @@ def split_multi_strips(img, fukuan_list_mm=None, standard_ratio_x=1,
             splits_1d = _try_legacy_valley_3_splits(
                 gray_for_position, W, H, positioning_method, detrend_sigma
             )
+            if splits_1d is not None and len(splits_1d) == 3:
+                mode = "fallback_legacy_valley_3"
         if splits_1d is None or len(splits_1d) != num_strips:
             splits_1d = _uniform_n_splits(W, num_strips)
+            mode = "fallback_uniform"
 
     full_W = img.shape[1]
     if scale_from_thumb != 1.0:
@@ -3174,6 +3197,13 @@ def split_multi_strips(img, fukuan_list_mm=None, standard_ratio_x=1,
         refined_strips.append(img[:, final_L:final_R])
 
     measured_mm = [float((r - l) * standard_ratio_x) for (l, r) in refined_splits]
+    # 若 primary 成功，但后续因最小宽度等被强修正，也仍保留 primary 标记（便于下游稳定器决策）
+    if used_primary and mode.startswith("primary_gradient_"):
+        if return_mode:
+            return refined_strips, measured_mm, refined_splits, mode
+        return refined_strips, measured_mm, refined_splits
+    if return_mode:
+        return refined_strips, measured_mm, refined_splits, mode
     return refined_strips, measured_mm, refined_splits
 #
 # def _smooth_1d(x, k=51):

@@ -248,6 +248,8 @@ def _post_sync_fixups() -> None:
             r"\1 \"-m\", _GEN_REPORT_MODULE,",
             s,
         )
+        # 兼容：若之前产生了转义引号导致语法错误，强制修正为分行参数
+        s = s.replace('"-u", \\"-m\\", _GEN_REPORT_MODULE,', '"-u",\n            "-m",\n            _GEN_REPORT_MODULE,')
         _write_text(ui_report_change, s)
 
     ui_report_center = DEST_ROOT / "ui" / "report_center.py"
@@ -279,6 +281,67 @@ def _post_sync_fixups() -> None:
             s,
         )
         _write_text(ui_cls_cfg, s)
+
+    # ---- PatchCore-only 强制收敛（防止主工程回退分支被同步回来）----
+    online_py = DEST_ROOT / "app" / "online" / "detect_anomalies_online.py"
+    if online_py.exists():
+        s = _read_text(online_py)
+        # 统一 _REPO_ROOT
+        s = re.sub(
+            r"^_REPO_ROOT\s*=\s*os\.path\.dirname\(os\.path\.abspath\(__file__\)\)\s*$",
+            "_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), \"..\", \"..\"))",
+            s,
+            flags=re.M,
+        )
+        # import 重写：function_bank/speed_monitor/patchcore_model
+        s = s.replace("from function_bank import", "from app.common.function_bank import")
+        s = re.sub(r"^\s*import\s+speed_monitor\s*$", "from app.common import speed_monitor", s, flags=re.M)
+        s = s.replace("from speed_monitor import", "from app.common.speed_monitor import")
+        s = re.sub(r"from\s+patchcore_model\.", "from models.patchcore_model.", s)
+        # 删除 seg_model_train UNet 入口
+        s = re.sub(r"^\s*from\s+seg_model_train\..*\n", "", s, flags=re.M)
+        # 删除 det_model 回退导入块
+        s = re.sub(
+            r"\n# 若使用 det_model[\s\S]*?DET_MODEL_AVAILABLE\s*=\s*False\s*\n",
+            "\n",
+            s,
+            flags=re.M,
+        )
+        # 删除 init_detect 内 SimpleAD/UNet 回退逻辑（保留 PatchCore 分支）
+        s = re.sub(
+            r"\n\s*def _resolve_det_ckpt\([\s\S]*?\n\s*F\s*=\s*get_one_image_list",
+            "\n\n    F = get_one_image_list",
+            s,
+            flags=re.M,
+        )
+        # 移除 model_name_det / model_name_unet 的兼容逻辑（PatchCore-only 不使用它们）
+        s = re.sub(r"^\s*model_name_det\s*=.*\n", "", s, flags=re.M)
+        s = re.sub(r"^\s*model_name_unet\s*=.*\n", "", s, flags=re.M)
+        s = re.sub(r"^\s*_norm\s*=\s*lambda.*\n", "", s, flags=re.M)
+        s = re.sub(r"^\s*if\s+not\s+model_name_det.*\n\s*model_name_det\s*=.*\n", "", s, flags=re.M)
+
+        # 若仍存在 “未找到 PatchCore…将尝试 det_model / UNet” 的提示，改为直接报错
+        s = re.sub(
+            r"print\(f\"\\[CAM\{cam_index \+ 1\}\\] 未找到 PatchCore 权重 \{memory_path\}，将尝试 det_model / UNet。\"\)",
+            "raise FileNotFoundError(\n                f\"[CAM{cam_index + 1}] 未找到 PatchCore 权重文件：{memory_path}\\n\"\n                f\"请检查：models/patchcore_model/{_weights_root_name}/image_data_patchcore_0228/CAM{cam_index + 1}/patchcore_memory.npz\"\n            )",
+            s,
+        )
+        # 删除 UNet 相关引用残留（避免 NameError）
+        s = re.sub(r"^\s*UNet\b.*\n", "", s, flags=re.M)
+        _write_text(online_py, s)
+
+    # 配置文件：移除已弃用字段（eff_ad / draem / seg_model_train model_name）
+    for cfg_name in ("config.yaml", "config_default.yaml"):
+        cfg_path = DEST_ROOT / "config" / cfg_name
+        if not cfg_path.exists():
+            continue
+        s = _read_text(cfg_path)
+        s = re.sub(r"^\s*cam[1-4]_eff_ad_ckpt\s*:.*\n", "", s, flags=re.M)
+        s = re.sub(r"^\s*cam[1-4]_draem_ckpt\s*:.*\n", "", s, flags=re.M)
+        s = re.sub(r"^\s*cam[1-4]_model_name\s*:.*seg_model_train.*\n", "", s, flags=re.M)
+        # 主工程可能仍保留 det_model 的 cam*_model_name（已不使用），也一并移除，避免误导
+        s = re.sub(r"^\s*cam[1-4]_model_name\s*:.*det_model.*\n", "", s, flags=re.M)
+        _write_text(cfg_path, s)
 
 
 def _sync_file(src: Path, dst: Path, *, kind: str) -> None:

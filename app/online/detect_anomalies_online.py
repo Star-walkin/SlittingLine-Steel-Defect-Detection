@@ -11,24 +11,14 @@ import socket
 import struct
 import cv2
 import glob
-from app.common.function_bank import (
-    test_one_image,
-    get_one_image_list,
-    Consecutive_anomaly_Checker,
-    Anomaly_info_List,
-    find_folders_with_id,
-    fix_json,
-    split_multi_strips,
-    dummy_context,
-    dummy_lock,
-    crop_square_from_image_u8,
-    DEFECT_PATCH_SIDE,
-)
+from app.common.function_bank import test_one_image, get_one_image_list, Consecutive_anomaly_Checker, Anomaly_info_List, \
+    find_folders_with_id, fix_json, split_multi_strips, dummy_context, dummy_lock, crop_square_from_image_u8, DEFECT_PATCH_SIDE
 import torch
 from datetime import datetime
 import traceback
 from app.common import speed_monitor
 from app.common.speed_monitor import init_monitor, get_monitor, StageTimer
+import shutil
 
 # PatchCore / 局部对比度（与 detectoutline02 一致）
 try:
@@ -168,6 +158,112 @@ def _get_line_idle_catchup_cfg():
         return (True, 2.0, 40)
 
 
+_fukuan_stable_cfg_cache = None
+_fukuan_stable_cfg_mtime = 0.0
+
+
+def _get_fukuan_stable_cfg():
+    """
+    读取幅宽稳定器参数（带 mtime 缓存）。
+    返回: (abs_tol_mm, rel_tol, max_step_mm, reject_modes)
+    """
+    global _fukuan_stable_cfg_cache, _fukuan_stable_cfg_mtime
+    path = os.path.join(_REPO_ROOT, "config", "config.yaml")
+    try:
+        mtime = os.path.getmtime(path)
+        if _fukuan_stable_cfg_cache is not None and mtime == _fukuan_stable_cfg_mtime:
+            return _fukuan_stable_cfg_cache
+        with open(path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        abs_tol = float(cfg.get("fukuan_stable_abs_tol_mm", 120) or 120)
+        rel_tol = float(cfg.get("fukuan_stable_rel_tol", 0.25) or 0.25)
+        max_step = float(cfg.get("fukuan_stable_max_step_mm", 60) or 60)
+        reject_modes = cfg.get("fukuan_reject_modes", ["fallback_uniform", "fallback_legacy_valley_3"])
+        if not isinstance(reject_modes, (list, tuple)):
+            reject_modes = [str(reject_modes)]
+        reject_modes = [str(x) for x in reject_modes]
+        abs_tol = max(0.0, abs_tol)
+        rel_tol = max(0.0, min(0.95, rel_tol))
+        max_step = max(0.0, max_step)
+        _fukuan_stable_cfg_cache = (abs_tol, rel_tol, max_step, reject_modes)
+        _fukuan_stable_cfg_mtime = mtime
+        return _fukuan_stable_cfg_cache
+    except Exception:
+        return (120.0, 0.25, 60.0, ["fallback_uniform", "fallback_legacy_valley_3"])
+
+
+def _cam_output_folder_name(cam_id_zero_based: int) -> str:
+    """
+    输出目录命名：
+    - 仅保留 CAM2/CAM3 两路：分别映射为 上表面/下表面
+    - 其它相机不应进入检测主流程
+    """
+    if int(cam_id_zero_based) == 1:
+        return "上表面"
+    if int(cam_id_zero_based) == 2:
+        return "下表面"
+    return str(int(cam_id_zero_based) + 1)
+
+
+class FukuanStabilizer:
+    """
+    幅宽稳定器（Hard clamp）：
+    - raw 只用于追溯与解释
+    - stable 永远不会出现离谱跳变，供 UI/坐标缩放使用
+    """
+
+    def __init__(self):
+        self.prev_stable = None
+
+    def update(self, raw_mm, f0_mm, mode: str):
+        abs_tol, rel_tol, max_step, reject_modes = _get_fukuan_stable_cfg()
+        limits = {"abs": abs_tol, "rel": rel_tol, "max_step": max_step}
+
+        try:
+            f0 = float(f0_mm)
+        except Exception:
+            f0 = 0.0
+        try:
+            raw = float(raw_mm)
+        except Exception:
+            raw = float("nan")
+
+        if not (f0 > 0):
+            # 标称非法：退回 raw（但仍钳制跳变）
+            f0 = raw if raw == raw and raw > 0 else 0.0
+
+        # 初始化 stable 的基准
+        base = self.prev_stable
+        if base is None:
+            base = f0 if (f0 > 0) else (raw if raw == raw else 0.0)
+
+        # mode 直接拒绝（低置信度回退）
+        if str(mode) in set(reject_modes):
+            self.prev_stable = float(base)
+            return float(base), False, "rejected_mode", limits
+
+        # raw 非法
+        if not (raw == raw) or raw <= 0:
+            self.prev_stable = float(base)
+            return float(base), False, "raw_invalid", limits
+
+        # 范围门禁（abs + rel 取交集）
+        lo = max(float(f0) - abs_tol, float(f0) * (1.0 - rel_tol))
+        hi = min(float(f0) + abs_tol, float(f0) * (1.0 + rel_tol))
+        lo = max(1e-6, lo)
+        if raw < lo or raw > hi:
+            self.prev_stable = float(base)
+            return float(base), False, "out_of_range", limits
+
+        # 跳变门禁
+        if max_step > 0 and abs(raw - float(base)) > max_step:
+            self.prev_stable = float(base)
+            return float(base), False, "jump_gt_max_step", limits
+
+        self.prev_stable = float(raw)
+        return float(raw), True, "ok", limits
+
+
 # per-camera lock 防止并发修改内存 list 结构（按相机一级锁）
 # 注意：在 main 中我们会根据 num_cams 初始化 cam_locks
 cam_locks = None  # 将在 main 初始化后替换为 list of threading.Lock()
@@ -201,7 +297,9 @@ def writer_loop():
     """
     write_queue 中任务样例（dict）:
     {"type":"save_anomaly", "info_process":..., "relpath":..., "value": ...}
-    {"type":"append_fukuan", "fpath": ..., "value": ...}
+    {"type":"append_fukuan", "fpath": ..., "value": ...}          # stable
+    {"type":"append_fukuan_raw", "fpath": ..., "value": ...}      # raw
+    {"type":"append_fukuan_meta", "fpath": ..., "value": {...}}   # meta dict
     {"type":"save_history_id", "info_process":..., "value": ...}
     """
 
@@ -310,6 +408,124 @@ def _process_batch(batch):
                         # 保留 tmp 以便排查
                         raise last_err
 
+            elif ttype == "append_fukuan_raw":
+                # raw 与 stable 写入同逻辑：JSON list append（值允许为 None）
+                fpath = task["fpath"]
+                val = task.get("value", None)
+                try:
+                    if os.path.exists(fpath):
+                        with open(fpath, "r", encoding="utf-8") as fr:
+                            data = json.load(fr)
+                    else:
+                        data = []
+                except Exception:
+                    data = []
+                data.append(val if val is None else float(val))
+                tmp = fpath + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as fw:
+                    json.dump(data, fw, ensure_ascii=False, indent=2)
+                replaced = False
+                last_err = None
+                for _ in range(5):
+                    try:
+                        os.replace(tmp, fpath)
+                        replaced = True
+                        break
+                    except Exception as e:
+                        last_err = e
+                        time.sleep(0.05)
+                if not replaced:
+                    try:
+                        with open(fpath, "w", encoding="utf-8") as fw:
+                            json.dump(data, fw, ensure_ascii=False, indent=2)
+                        try:
+                            os.remove(tmp)
+                        except Exception:
+                            pass
+                    except Exception:
+                        raise last_err
+
+            elif ttype == "append_fukuan_meta":
+                # meta：JSON list append（dict）
+                fpath = task["fpath"]
+                val = task.get("value", None)
+                if val is None:
+                    continue
+                try:
+                    if os.path.exists(fpath):
+                        with open(fpath, "r", encoding="utf-8") as fr:
+                            data = json.load(fr)
+                    else:
+                        data = []
+                except Exception:
+                    data = []
+                if not isinstance(data, list):
+                    data = []
+                data.append(val)
+                tmp = fpath + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as fw:
+                    json.dump(data, fw, ensure_ascii=False, indent=2)
+                replaced = False
+                last_err = None
+                for _ in range(5):
+                    try:
+                        os.replace(tmp, fpath)
+                        replaced = True
+                        break
+                    except Exception as e:
+                        last_err = e
+                        time.sleep(0.05)
+                if not replaced:
+                    try:
+                        with open(fpath, "w", encoding="utf-8") as fw:
+                            json.dump(data, fw, ensure_ascii=False, indent=2)
+                        try:
+                            os.remove(tmp)
+                        except Exception:
+                            pass
+                    except Exception:
+                        raise last_err
+
+            elif ttype == "append_jsonl_line":
+                # JSONL：追加一行（dict -> json + \\n）。支持按文件大小轮转。
+                fpath = task["fpath"]
+                val = task.get("value", None)
+                if val is None:
+                    continue
+                rotate_mb = float(task.get("rotate_mb", 64) or 64)
+                rotate_bytes = int(max(1, rotate_mb) * 1024 * 1024)
+                try:
+                    os.makedirs(os.path.dirname(fpath), exist_ok=True)
+                except Exception:
+                    pass
+                # 轮转：若超过阈值，重命名为 _0001/_0002...
+                try:
+                    if os.path.exists(fpath) and os.path.getsize(fpath) >= rotate_bytes:
+                        base, ext = os.path.splitext(fpath)
+                        if not ext:
+                            ext = ".jsonl"
+                        k = 1
+                        while True:
+                            rotated = f"{base}_{k:04d}{ext}"
+                            if not os.path.exists(rotated):
+                                try:
+                                    os.replace(fpath, rotated)
+                                except Exception:
+                                    pass
+                                break
+                            k += 1
+                            if k > 9999:
+                                break
+                except Exception:
+                    pass
+                # 追加写一行（文本 append；尾行半截由读端容错）
+                try:
+                    line = json.dumps(val, ensure_ascii=False)
+                    with open(fpath, "a", encoding="utf-8") as fw:
+                        fw.write(line + "\n")
+                except Exception as e:
+                    print("writer task exception(jsonl):", e)
+
             elif ttype == "save_history_id":
                 info_process = task["info_process"]
                 value = task["value"]
@@ -356,7 +572,7 @@ def init_detect(conduct_id, result_path_all, Consecutive_thres_num, cam_index):
     img_size = config[f"cam{cam_index + 1}_img_size"]
     cam_y_times = config[f"cam{cam_index + 1}_times"]
 
-    cam_folder = f"{cam_index + 1}"
+    cam_folder = _cam_output_folder_name(cam_index)
     result_path = os.path.join(result_path_all, cam_folder)
     os.makedirs(result_path, exist_ok=True)
 
@@ -371,7 +587,14 @@ def init_detect(conduct_id, result_path_all, Consecutive_thres_num, cam_index):
         strip_dir = os.path.join(result_path, f"strip_{i + 1}")
         os.makedirs(strip_dir, exist_ok=True)
         os.makedirs(os.path.join(strip_dir, "defect_images"), exist_ok=True)
-        for name in ["image_anomaly_center.json", "image_anomaly_area.json", "fukuan.json"]:
+        for name in [
+            "image_anomaly_center.json",
+            "image_anomaly_area.json",
+            # Stable/Raw/Meta：Stable 写 fukuan.json 供 UI 使用；Raw 与 meta 便于追溯解释
+            "fukuan.json",
+            "fukuan_raw.json",
+            "fukuan_meta.json",
+        ]:
             fpath = os.path.join(strip_dir, name)
             if not os.path.exists(fpath):
                 json.dump([], open(fpath, "w", encoding="utf-8"), ensure_ascii=False, indent=4)
@@ -385,7 +608,7 @@ def init_detect(conduct_id, result_path_all, Consecutive_thres_num, cam_index):
             root_dir = os.path.dirname(os.path.abspath(__file__))
             _weights_root_name = config.get("patchcore_weights_root", "weights")
             patchcore_root = os.path.join(
-                root_dir, "models", "patchcore_model", _weights_root_name, "image_data_patchcore_0228"
+                _REPO_ROOT, "models", "patchcore_model", _weights_root_name, "image_data_patchcore_0228"
             )
             cam_name = f"CAM{cam_index + 1}"
             memory_path = os.path.join(patchcore_root, cam_name, "patchcore_memory.npz")
@@ -421,6 +644,8 @@ def init_detect(conduct_id, result_path_all, Consecutive_thres_num, cam_index):
                 )
         except Exception as e:
             raise RuntimeError(f"[CAM{cam_index + 1}] PatchCoreDetector 初始化失败: {e}") from e
+    else:
+        raise RuntimeError(f"[CAM{cam_index + 1}] PatchCore 模块不可用，无法启动检测。")
 
     F = get_one_image_list(cut_ratio=cut_ratio, standard_ratio_x=standard_ratio_x, fukuan0=fukuan0)
     Checker = Consecutive_anomaly_Checker(thres_num=Consecutive_thres_num, calibrate_cam=calibrat_cam_id)
@@ -515,6 +740,40 @@ def detect(img, new_image_id, cam_id, strip_id, M, F, Checker, info_process, sav
             original_strip_for_crop=img,
         )
 
+    # 增量事件流（JSONL）：每帧每条带钢追加一行，供 UI 追尾读取，避免长期运行全量 JSON 越来越大
+    try:
+        _cfg = {}
+        try:
+            with open(os.path.join(_REPO_ROOT, "config", "config.yaml"), "r", encoding="utf-8") as _f:
+                _cfg = yaml.safe_load(_f) or {}
+        except Exception:
+            _cfg = {}
+        if str(_cfg.get("detect_coord_format", "jsonl")).lower() == "jsonl":
+            rotate_mb = float(_cfg.get("coord_jsonl_rotate_mb", 64) or 64)
+            ev_path = os.path.join(strip_folder, "defect_events_center.jsonl")
+            pts = []
+            if isinstance(center_coords, list):
+                for p in center_coords:
+                    try:
+                        x, y = p
+                        pts.append([float(x), float(y)])
+                    except Exception:
+                        pass
+            write_queue.put({
+                "type": "append_jsonl_line",
+                "fpath": ev_path,
+                "rotate_mb": rotate_mb,
+                "value": {
+                    "ts": float(time.time()),
+                    "new_id": int(new_image_id),
+                    "cam_id": int(cam_id),
+                    "strip_id": int(strip_id),
+                    "points": pts,
+                },
+            })
+    except Exception:
+        pass
+
     lock = None
     if cam_locks is not None:
         lock = cam_locks[cam_id]
@@ -541,12 +800,7 @@ def detect(img, new_image_id, cam_id, strip_id, M, F, Checker, info_process, sav
         info_process.save_anomaly_info(f"image_anomaly_center.json", image_anomaly_center_list)
         info_process.save_anomaly_info(f"image_anomaly_area.json", image_anomaly_area_list)
 
-    fukuan_path = os.path.join(os.path.join(save_root, f"strip_{strip_id + 1}"), "fukuan.json")
-    write_queue.put({
-        "type": "append_fukuan",
-        "fpath": fukuan_path,
-        "value": float(fukuan_value)
-    })
+    # 幅宽写入统一由 worker 完成（Stable/Raw/Meta），避免每条带 detect() 重复 append 导致序列翻倍
 
     if center_coords and area_list and area_list[-1] == 10000:
         save_path = os.path.join(
@@ -581,10 +835,19 @@ def process_image(image_data, history_image_id_list, index, cam_id,
     else:
         fukuan_est = F.fukuan0
 
-    strip_imgs, measured_widths_mm = split_multi_strips(
-        img, fukuan_list_mm=fukuan_est, standard_ratio_x=F.standard_ratio_x
+    # 兼容：split_multi_strips 现返回 (strips, measured_mm, splits, mode)
+    strip_imgs, measured_widths_mm, _splits, _mode = split_multi_strips(
+        img,
+        fukuan_list_mm=fukuan_est,
+        standard_ratio_x=F.standard_ratio_x,
+        cam_id=cam_id,
+        return_mode=True,
     )
-    fukuan_list[cam_id] = measured_widths_mm
+    # 这里仅保留数值序列（用于后续估计）；稳定器逻辑在主 worker 路径中实现
+    try:
+        fukuan_list[cam_id] = measured_widths_mm
+    except Exception:
+        pass
 
     last_id = history_image_id_list[cam_id]
     new_id = last_id + 1
@@ -681,7 +944,7 @@ def receive_images(sock, cam_id, image_queue):
 
 # ------------------------- GPU图像处理线程（切分/检测与 detectoutline02.worker 对齐） -------------------------
 def worker(image_queue, cam_id, history_image_id_list, M, F, Checker, info_process, save_root,
-           Consecutive_Check, image_anomaly_center_list, image_anomaly_area_list, fukuan_list,
+           Consecutive_Check, image_anomaly_center_list, image_anomaly_area_list, fukuan_list, fukuan_stabilizers,
            model_channels=1, infer_engine=None, lite_cam_ids=frozenset()):
     """
     image_queue: 每项 (data_bytes, idx)；若 data_bytes is None => 退出
@@ -744,12 +1007,13 @@ def worker(image_queue, cam_id, history_image_id_list, M, F, Checker, info_proce
             if need_recalc:
                 try:
                     with StageTimer(cam_id, "split"):
-                        strip_imgs, measured_widths_mm, splits = split_multi_strips(
+                        strip_imgs, measured_widths_mm, splits, split_mode = split_multi_strips(
                             gray,
                             fukuan_list_mm=fukuan_est,
                             standard_ratio_x=F.standard_ratio_x,
                             cam_id=cam_id,
                             use_thumbnail=True,   # 缩略图定位加速（~3x）
+                            return_mode=True,
                         )
                     last_splits = splits
                     last_measured_widths = measured_widths_mm
@@ -757,12 +1021,14 @@ def worker(image_queue, cam_id, history_image_id_list, M, F, Checker, info_proce
                     if last_splits:
                         strip_imgs = cut_by_splits(gray, last_splits)
                         measured_widths_mm = last_measured_widths
+                        split_mode = "reuse_cached_splits"
                     else:
                         image_queue.task_done()
                         return
             else:
                 strip_imgs = cut_by_splits(gray, last_splits)
                 measured_widths_mm = last_measured_widths if last_measured_widths else fukuan_est
+                split_mode = "reuse_cached_splits"
 
             expected_num = len(F.fukuan0)
             actual_num = len(strip_imgs)
@@ -849,19 +1115,60 @@ def worker(image_queue, cam_id, history_image_id_list, M, F, Checker, info_proce
             # 收集本帧各条带的任务参数（cam_lock 内仅做 CPU 准备）
             strip_tasks = []
             for i in range(iter_num):
+                raw_fw = measured_widths_mm[i] if i < len(measured_widths_mm) else fukuan_est[i]
+                f0 = F.fukuan0[i] if i < len(F.fukuan0) else raw_fw
+                stab = fukuan_stabilizers[i] if i < len(fukuan_stabilizers) else FukuanStabilizer()
+                stable_fw, valid, reason, limits = stab.update(raw_fw, f0, split_mode)
+                # 更新内存序列（用于下一次 fukuan_est 更稳定）
+                try:
+                    fukuan_list[i].append(float(stable_fw))
+                    if len(fukuan_list[i]) > 300:
+                        fukuan_list[i] = fukuan_list[i][-220:]
+                except Exception:
+                    pass
                 strip_tasks.append((
                     strip_imgs[i],
                     new_id,
                     i,
-                    measured_widths_mm[i] if i < len(measured_widths_mm) else fukuan_est[i],
+                    float(raw_fw) if raw_fw is not None else None,
+                    float(stable_fw),
+                    bool(valid),
+                    str(reason),
+                    str(split_mode),
+                    float(f0) if f0 is not None else None,
+                    limits,
                 ))
 
         # ---- 暂停 / 轻量模式：只写幅宽（并保持 history_image_id 继续递增），跳过缺陷检测 ----
         # 暂停时不杀发送端/不关连接，只是让接收端不做缺陷推理；长度从历史继续走。
         if pause_event.is_set() or (cam_id in lite_cam_ids):
-            for _, nid, sid, fw in strip_tasks:
-                fukuan_path = os.path.join(save_root, f"strip_{sid + 1}", "fukuan.json")
-                write_queue.put({"type": "append_fukuan", "fpath": fukuan_path, "value": float(fw)})
+            now_ts = time.time()
+            for _, nid, sid, raw_fw, stable_fw, valid, reason, s_mode, f0, limits in strip_tasks:
+                base = os.path.join(save_root, f"strip_{sid + 1}")
+                stable_path = os.path.join(base, "fukuan.json")
+                raw_path = os.path.join(base, "fukuan_raw.json")
+                meta_path = os.path.join(base, "fukuan_meta.json")
+                write_queue.put({"type": "append_fukuan", "fpath": stable_path, "value": float(stable_fw)})
+                write_queue.put({"type": "append_fukuan_raw", "fpath": raw_path, "value": None if raw_fw is None else float(raw_fw)})
+                write_queue.put({
+                    "type": "append_fukuan_meta",
+                    "fpath": meta_path,
+                    "value": {
+                        "ts": float(now_ts),
+                        "raw": raw_fw,
+                        "stable": float(stable_fw),
+                        "valid": bool(valid),
+                        "reason": str(reason),
+                        "mode": str(s_mode),
+                        "f0": f0,
+                        "limits": limits,
+                        "new_id": int(nid),
+                        "cam_id": int(cam_id),
+                        "strip_id": int(sid),
+                        "paused": bool(pause_event.is_set()),
+                        "lite": bool(cam_id in lite_cam_ids),
+                    },
+                })
             processed_count += 1
             image_queue.task_done()
             _mon_p = get_monitor()
@@ -873,14 +1180,14 @@ def worker(image_queue, cam_id, history_image_id_list, M, F, Checker, info_proce
         if infer_engine is not None:
             # 向 InferEngine 提交所有条带任务，立即获得 Future（非阻塞）
             futures = []
-            for strip_np, nid, sid, fw in strip_tasks:
+            for strip_np, nid, sid, raw_fw, stable_fw, valid, reason, s_mode, f0, limits in strip_tasks:
                 future = infer_engine.submit(
                     detect,
                     strip_np, nid, cam_id, sid,
                     M, F, Checker, info_process, save_root, Consecutive_Check,
                     image_anomaly_center_list[sid],
                     image_anomaly_area_list[sid],
-                    fw,
+                    stable_fw,
                     model_channels=model_channels,
                 )
                 futures.append(future)
@@ -893,19 +1200,51 @@ def worker(image_queue, cam_id, history_image_id_list, M, F, Checker, info_proce
                     traceback.print_exc()
         else:
             # 回退路径：直接调用（不使用 InferEngine）
-            for strip_np, nid, sid, fw in strip_tasks:
+            for strip_np, nid, sid, raw_fw, stable_fw, valid, reason, s_mode, f0, limits in strip_tasks:
                 try:
                     detect(
                         strip_np, nid, cam_id, sid,
                         M, F, Checker, info_process, save_root, Consecutive_Check,
                         image_anomaly_center_list[sid],
                         image_anomaly_area_list[sid],
-                        fw,
+                        stable_fw,
                         model_channels=model_channels,
                     )
                 except Exception as e:
                     print(f"[ERR] {local_name} detect error strip{sid} idx={idx}: {e}")
                     traceback.print_exc()
+
+        # ---- 本帧写入幅宽（Stable/Raw/Meta）----
+        try:
+            now_ts = time.time()
+            for _, nid, sid, raw_fw, stable_fw, valid, reason, s_mode, f0, limits in strip_tasks:
+                base = os.path.join(save_root, f"strip_{sid + 1}")
+                stable_path = os.path.join(base, "fukuan.json")
+                raw_path = os.path.join(base, "fukuan_raw.json")
+                meta_path = os.path.join(base, "fukuan_meta.json")
+                write_queue.put({"type": "append_fukuan", "fpath": stable_path, "value": float(stable_fw)})
+                write_queue.put({"type": "append_fukuan_raw", "fpath": raw_path, "value": None if raw_fw is None else float(raw_fw)})
+                write_queue.put({
+                    "type": "append_fukuan_meta",
+                    "fpath": meta_path,
+                    "value": {
+                        "ts": float(now_ts),
+                        "raw": raw_fw,
+                        "stable": float(stable_fw),
+                        "valid": bool(valid),
+                        "reason": str(reason),
+                        "mode": str(s_mode),
+                        "f0": f0,
+                        "limits": limits,
+                        "new_id": int(nid),
+                        "cam_id": int(cam_id),
+                        "strip_id": int(sid),
+                        "paused": False,
+                        "lite": False,
+                    },
+                })
+        except Exception:
+            pass
 
         processed_count += 1
 
@@ -1008,6 +1347,15 @@ def run_online(cwd_base_result=None):
 
     ports = [8885, 8886, 8887, 8888]
     num_cams = len(ports)
+    # 仅启用 CAM2/CAM3（0-based: 1,2）
+    active_cam_ids = config.get("active_cam_ids", [1, 2])
+    if not isinstance(active_cam_ids, (list, tuple)):
+        active_cam_ids = [active_cam_ids]
+    active_cam_ids = sorted({int(x) for x in active_cam_ids})
+    active_cam_ids = [x for x in active_cam_ids if 0 <= x < num_cams]
+    if not active_cam_ids:
+        active_cam_ids = [1, 2]
+    print(f"[config] active_cam_ids(0-based)={active_cam_ids}，输出目录将使用 上表面/下表面")
 
     # ---- 启动速度监控器（终端周期性打印：各相机接收速率、处理速率、队列、分阶段耗时）----
     _rep_sec = float(config.get("speed_report_interval_sec", 5.0))
@@ -1026,10 +1374,13 @@ def run_online(cwd_base_result=None):
 
     image_anomaly_center_list = [[[] for _ in range(num_strips)] for _ in range(num_cams)]
     image_anomaly_area_list = [[[] for _ in range(num_strips)] for _ in range(num_cams)]
+    # fukuan_list：用于切分估计的历史序列（此方案中将保存 Stable，更稳）
     fukuan_list = [[[] for _ in range(num_strips)] for _ in range(num_cams)]
+    # 每相机每条带钢一个稳定器（Hard clamp）
+    fukuan_stabilizers = [[FukuanStabilizer() for _ in range(num_strips)] for _ in range(num_cams)]
     history_image_id_list = [0 for _ in range(num_cams)]
-    for _ci in range(num_cams):
-        _hid = os.path.join(base_result_path, str(_ci + 1), "history_image_id.json")
+    for _ci in active_cam_ids:
+        _hid = os.path.join(base_result_path, _cam_output_folder_name(_ci), "history_image_id.json")
         try:
             with open(_hid, "r", encoding="utf-8") as _hf:
                 _raw = json.load(_hf)
@@ -1039,6 +1390,21 @@ def run_online(cwd_base_result=None):
                 history_image_id_list[_ci] = int(_raw) if _raw is not None else 0
         except (FileNotFoundError, json.JSONDecodeError, TypeError, ValueError):
             pass
+
+    # 清理未启用相机目录（可选）
+    try:
+        if bool(config.get("cleanup_unused_cam_dirs", True)):
+            for _ci in range(num_cams):
+                if _ci in active_cam_ids:
+                    continue
+                legacy_dir = os.path.join(base_result_path, str(_ci + 1))
+                if os.path.isdir(legacy_dir):
+                    try:
+                        shutil.rmtree(legacy_dir, ignore_errors=True)
+                    except Exception:
+                        pass
+    except Exception:
+        pass
 
     # 启动单个 writer（全局唯一）
     writer_t = threading.Thread(target=writer_loop, daemon=True)
@@ -1058,8 +1424,9 @@ def run_online(cwd_base_result=None):
     listen_sockets = []
     infer_engines = []
 
-    # 为每个相机做初始化并启动接收/worker
-    for cam_id, port in enumerate(ports):
+    # 为启用相机做初始化并启动接收/worker
+    for cam_id in active_cam_ids:
+        port = ports[cam_id]
         # init per-camera detector (尽量只初始化一次)
         M, F, Checker, info_process, save_root, in_channels_detected = init_detect(
             conduct_id, base_result_path, Consecutive_thres_num, cam_id
@@ -1091,7 +1458,7 @@ def run_online(cwd_base_result=None):
                 args=(
                     image_queues[cam_id], cam_id, history_image_id_list,
                     M, F, Checker, info_process, save_root, Consecutive_Check,
-                    image_anomaly_center_list[cam_id], image_anomaly_area_list[cam_id], fukuan_list[cam_id],
+                    image_anomaly_center_list[cam_id], image_anomaly_area_list[cam_id], fukuan_list[cam_id], fukuan_stabilizers[cam_id],
                     in_channels_detected,
                 ),
                 kwargs={"infer_engine": cam_infer_engine, "lite_cam_ids": lite_cam_ids},
@@ -1163,6 +1530,19 @@ if __name__ == "__main__":
 
     folder_id_now = find_folders_with_id(base_path="D:\\detect result", product_id=conduct_id)
     num_cams = 4
+    # 仅启用 CAM2/CAM3 输出（0-based: 1,2）
+    try:
+        with open(os.path.join(_REPO_ROOT, 'config', 'config.yaml'), 'r', encoding='utf-8') as _cf:
+            _cfg = yaml.safe_load(_cf) or {}
+        active_cam_ids = _cfg.get("active_cam_ids", [1, 2])
+        if not isinstance(active_cam_ids, (list, tuple)):
+            active_cam_ids = [active_cam_ids]
+        active_cam_ids = sorted({int(x) for x in active_cam_ids})
+        active_cam_ids = [x for x in active_cam_ids if 0 <= x < num_cams]
+        if not active_cam_ids:
+            active_cam_ids = [1, 2]
+    except Exception:
+        active_cam_ids = [1, 2]
     image_anomaly_center_list = [[[] for _ in range(num_strips)] for _ in range(num_cams)]
     image_anomaly_area_list = [[[] for _ in range(num_strips)] for _ in range(num_cams)]
     fukuan_list = [[[] for _ in range(num_strips)] for _ in range(num_cams)]
@@ -1170,9 +1550,9 @@ if __name__ == "__main__":
 
     if folder_id_now:
         result_path_all = folder_id_now[0]
-        for cam_idx in range(num_cams):
+        for cam_idx in active_cam_ids:
             for strip_idx in range(num_strips):
-                folder_path = os.path.join(result_path_all, f"{cam_idx + 1}", f"strip_{strip_idx + 1}")
+                folder_path = os.path.join(result_path_all, _cam_output_folder_name(cam_idx), f"strip_{strip_idx + 1}")
                 try:
                     with open(os.path.join(folder_path, "image_anomaly_center.json"), 'r', encoding='utf-8') as file:
                         image_anomaly_center_list[cam_idx][strip_idx] = fix_json(file.read())
@@ -1188,7 +1568,7 @@ if __name__ == "__main__":
                         fukuan_list[cam_idx][strip_idx] = fix_json(file.read())
                 except FileNotFoundError:
                     fukuan_list[cam_idx][strip_idx] = []
-            hid_path = os.path.join(result_path_all, f"{cam_idx + 1}", "history_image_id.json")
+            hid_path = os.path.join(result_path_all, _cam_output_folder_name(cam_idx), "history_image_id.json")
             try:
                 with open(hid_path, "r", encoding="utf-8") as file:
                     raw = json.load(file)

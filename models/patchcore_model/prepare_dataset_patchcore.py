@@ -7,7 +7,7 @@
 完全一致（同一套「切带 + FFT 去纹 + 纵向滤波 + 中值拍平 + 竖直切块」）。
 
 数据来源与规则：
-- 上游从 recv_* 目录中筛选样本并做一次 FFT 去纹，
+- 上游使用 seg_model_train/img_select.py 从 recv_* 目录中筛选样本并做一次 FFT 去纹，
   输出到: D:/pycharm_project/steeldefect/img_raw_0228/cam*_origin, cam*_filter
 - 本脚本默认读取 cam*_filter 目录（已经过 img_select 的筛选与一次 FFT 去纹）
 - 然后对整幅 4096x4096 图做：

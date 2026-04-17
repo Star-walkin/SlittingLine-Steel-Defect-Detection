@@ -24,7 +24,7 @@ CENTER_PROTECT_FFT = 15
 
 
 def apply_fft_deripple(gray: np.ndarray) -> np.ndarray:
-    """对灰度图做 FFT 去纹（PatchCore/预处理链路可复用）。"""
+    """对灰度图做 FFT 去纹，与 seg_model_train/img_select 中 process_and_save_image 一致。"""
     rows, cols = gray.shape
     dft = cv2.dft(np.float32(gray), flags=cv2.DFT_COMPLEX_OUTPUT)
     dft_shift = np.fft.fftshift(dft)

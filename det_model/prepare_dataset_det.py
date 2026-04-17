@@ -9,7 +9,7 @@ det_model/prepare_dataset_det.py
   4. 纵向滤波（apply_vertical_filter）：去除轧制纹/列 PRNU
   5. 背景拍平：中值滤波 + 减背景 + 背景均值补偿
 
-数据集处理步骤（仅保留预处理能力，供 PatchCore 数据准备复用）：
+数据集步骤沿用 seg_model_train/data_prepare.py：
   - 使用 function_bank.split_multi_strips 切带
   - 按条带竖直分段，输出到 CAMx/train/good/
 
