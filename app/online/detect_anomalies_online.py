@@ -4,27 +4,38 @@ import queue
 import threading
 import time
 import os
-_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 import json
 import yaml
 import socket
 import struct
 import cv2
 import glob
-from app.common.function_bank import test_one_image, get_one_image_list, Consecutive_anomaly_Checker, Anomaly_info_List, \
+from function_bank import test_one_image, get_one_image_list, Consecutive_anomaly_Checker, Anomaly_info_List, \
     find_folders_with_id, fix_json, split_multi_strips, dummy_context, dummy_lock, crop_square_from_image_u8, DEFECT_PATCH_SIDE
+from seg_model_train.seg_model_NEW import UNet
 import torch
 from datetime import datetime
 import traceback
-from app.common import speed_monitor
-from app.common.speed_monitor import init_monitor, get_monitor, StageTimer
+import speed_monitor
+from speed_monitor import init_monitor, get_monitor, StageTimer
 import shutil
+
+# 若使用 det_model（SimpleAD + 滑动窗口）
+try:
+    from det_model.model import build_model as build_simplead
+    from det_model.infer import SlidingWindowDetector
+    DET_MODEL_AVAILABLE = True
+except ImportError:
+    build_simplead = None
+    SlidingWindowDetector = None
+    DET_MODEL_AVAILABLE = False
 
 # PatchCore / 局部对比度（与 detectoutline02 一致）
 try:
-    from models.patchcore_model.online_detector import PatchCoreDetector, InferEngine
-    from models.patchcore_model.gradient_defect import detect_defects_by_gradient
-    from models.patchcore_model.local_contrast_defect import detect_defects_by_local_contrast
+    from patchcore_model.online_detector import PatchCoreDetector, InferEngine
+    from patchcore_model.gradient_defect import detect_defects_by_gradient
+    from patchcore_model.local_contrast_defect import detect_defects_by_local_contrast
     PATCHCORE_AVAILABLE = True
 except ImportError:
     PatchCoreDetector = None
@@ -41,7 +52,9 @@ def _get_safe_device():
       'Torch not compiled with CUDA enabled' 异常。
     """
     try:
-        if torch.cuda.is_available():
+        # torch.cuda.is_available() 在某些环境可能为 True，但 device_count=0（无 GPU）
+        # 这种情况下继续使用 cuda 会触发 "No CUDA GPUs are available"。
+        if torch.cuda.is_available() and int(torch.cuda.device_count() or 0) > 0:
             return torch.device("cuda")
     except Exception:
         pass
@@ -190,6 +203,33 @@ def _get_fukuan_stable_cfg():
         return _fukuan_stable_cfg_cache
     except Exception:
         return (120.0, 0.25, 60.0, ["fallback_uniform", "fallback_legacy_valley_3"])
+
+
+_coord_fmt_cache = None
+_coord_fmt_mtime = 0.0
+
+
+def _get_detect_coord_format():
+    """
+    返回检测端坐标写盘格式：'jsonl' 或 'legacy_json'。
+    带 mtime 缓存，避免每帧重复读配置。
+    """
+    global _coord_fmt_cache, _coord_fmt_mtime
+    path = os.path.join(_REPO_ROOT, "config", "config.yaml")
+    try:
+        mtime = os.path.getmtime(path)
+        if _coord_fmt_cache is not None and mtime == _coord_fmt_mtime:
+            return _coord_fmt_cache
+        with open(path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        fmt = str(cfg.get("detect_coord_format", "jsonl") or "jsonl").lower()
+        if fmt not in ("jsonl", "legacy_json"):
+            fmt = "jsonl"
+        _coord_fmt_cache = fmt
+        _coord_fmt_mtime = mtime
+        return fmt
+    except Exception:
+        return "jsonl"
 
 
 def _cam_output_folder_name(cam_id_zero_based: int) -> str:
@@ -542,7 +582,7 @@ def _process_batch(batch):
 
 def init_detect(conduct_id, result_path_all, Consecutive_thres_num, cam_index):
     """
-    PatchCore 在线检测初始化（已移除其它模型回退分支）。
+    与 detectoutline02.init_detect 对齐：PatchCore → SimpleAD(det_model) → UNet。
     结果目录与线下一致：result_path_all / {cam_index+1} / strip_*
     """
     with open(os.path.join(_REPO_ROOT, 'config', 'config0.yaml'), 'r', encoding='utf-8') as f:
@@ -568,6 +608,17 @@ def init_detect(conduct_id, result_path_all, Consecutive_thres_num, cam_index):
     patchcore_edge_weight_profile = config.get(
         f"cam{cam_index + 1}_patchcore_edge_weight_profile", "ease_out_cubic"
     )
+    # defect_images 写盘限流（保护 CPU/磁盘；缺陷坐标 jsonl 不受影响）
+    _save_img_enable = bool(config.get("save_defect_images_enable", True))
+    _save_img_min_area = int(config.get("save_defect_images_min_area", 0) or 0)
+    _save_img_max_per_frame = int(config.get("save_defect_images_max_per_frame", 12) or 12)
+    _save_img_max_per_min = int(config.get("save_defect_images_max_per_minute", 240) or 240)
+    _save_img_keep_last = int(config.get("save_defect_images_keep_last_n", 2000) or 2000)
+    model_name_det = config.get(f"cam{cam_index + 1}_model_name_det")
+    model_name_unet = config.get(f"cam{cam_index + 1}_model_name")
+    _norm = lambda p: (p or "").replace("\\", "/")
+    if not model_name_det and model_name_unet and "det_model" in _norm(model_name_unet) and "train-result" in _norm(model_name_unet):
+        model_name_det = model_name_unet
     cut_ratio = config[f"cam{cam_index + 1}_cut_ratio"]
     img_size = config[f"cam{cam_index + 1}_img_size"]
     cam_y_times = config[f"cam{cam_index + 1}_times"]
@@ -608,7 +659,7 @@ def init_detect(conduct_id, result_path_all, Consecutive_thres_num, cam_index):
             root_dir = os.path.dirname(os.path.abspath(__file__))
             _weights_root_name = config.get("patchcore_weights_root", "weights")
             patchcore_root = os.path.join(
-                _REPO_ROOT, "models", "patchcore_model", _weights_root_name, "image_data_patchcore_0228"
+                root_dir, "patchcore_model", _weights_root_name, "image_data_patchcore_0228"
             )
             cam_name = f"CAM{cam_index + 1}"
             memory_path = os.path.join(patchcore_root, cam_name, "patchcore_memory.npz")
@@ -638,14 +689,117 @@ def init_detect(conduct_id, result_path_all, Consecutive_thres_num, cam_index):
                     patchcore_edge_weight_profile=patchcore_edge_weight_profile,
                 )
             else:
-                raise FileNotFoundError(
-                    f"[CAM{cam_index + 1}] 未找到 PatchCore 权重文件：{memory_path}\n"
-                    f"请检查：models/patchcore_model/{_weights_root_name}/image_data_patchcore_0228/{cam_name}/patchcore_memory.npz"
-                )
+                print(f"[CAM{cam_index + 1}] 未找到 PatchCore 权重 {memory_path}，将尝试 det_model / UNet。")
         except Exception as e:
-            raise RuntimeError(f"[CAM{cam_index + 1}] PatchCoreDetector 初始化失败: {e}") from e
-    else:
-        raise RuntimeError(f"[CAM{cam_index + 1}] PatchCore 模块不可用，无法启动检测。")
+            print(f"[CAM{cam_index + 1}] PatchCoreDetector 初始化失败，将回退: {e}")
+            M = None
+
+    # 将 defect_images 写盘限流参数注入到 locator（PatchCoreDetector 内部使用 test_one_image 作为 locator）
+    try:
+        loc = getattr(M, "_locator", None)
+        if loc is not None:
+            loc.save_defect_images_enable = _save_img_enable
+            loc.save_defect_images_min_area = _save_img_min_area
+            loc.save_defect_images_max_per_frame = _save_img_max_per_frame
+            loc.save_defect_images_max_per_minute = _save_img_max_per_min
+            loc.save_defect_images_keep_last_n = _save_img_keep_last
+    except Exception:
+        pass
+
+    def _resolve_det_ckpt(path: str):
+        if not path:
+            return None
+        if os.path.isfile(path):
+            return path
+        try:
+            base_dir = os.path.dirname(path)
+            if not os.path.isdir(base_dir):
+                return None
+            lp = os.path.join(base_dir, "last.pth")
+            if os.path.isfile(lp):
+                return lp
+            best = None
+            for fn in os.listdir(base_dir):
+                if not (fn.startswith("epoch_") and fn.endswith(".pth")):
+                    continue
+                try:
+                    ep = int(fn.split("_", 1)[1].split(".", 1)[0])
+                except Exception:
+                    continue
+                if best is None or ep > best[0]:
+                    best = (ep, fn)
+            if best is not None:
+                return os.path.join(base_dir, best[1])
+        except Exception:
+            pass
+        return None
+
+    det_ckpt_path = _resolve_det_ckpt(model_name_det)
+    _device = _get_safe_device()
+    print(f"[CAM{cam_index + 1}] 使用设备: {_device}")
+
+    tried_simplead = False
+    if M is None and DET_MODEL_AVAILABLE and det_ckpt_path and os.path.isfile(det_ckpt_path):
+        tried_simplead = True
+        try:
+            print(f"[CAM{cam_index + 1}] Loading SimpleAD: {det_ckpt_path}")
+            state_dict = torch.load(det_ckpt_path, map_location=_device)
+            model = build_simplead(base_ch=32).to(_device)
+            model.load_state_dict(state_dict)
+            model.eval()
+            M = SlidingWindowDetector(
+                model=model, conduct_id=conduct_id, fukuan0=fukuan0, cut_ratio=cut_ratio,
+                img_size=img_size, seg_anomaly_thres=seg_anomaly_thres,
+                standard_ratio_x=standard_ratio_x, standard_ratio_y=standard_ratio_y, steel_real_y0=steel_real_y0,
+                flatten_bg=True, patch_stride=128
+            )
+        except Exception as e:
+            print(f"[CAM{cam_index + 1}] SimpleAD 加载失败，回退 UNet: {e}")
+            M = None
+
+    if M is None:
+        candidates = []
+        if model_name_unet and os.path.isfile(model_name_unet):
+            if not (tried_simplead and det_ckpt_path and os.path.normpath(model_name_unet) == os.path.normpath(det_ckpt_path)):
+                candidates.append(model_name_unet)
+        if model_name_det and os.path.isfile(model_name_det):
+            try:
+                sd = torch.load(model_name_det, map_location="cpu")
+                if isinstance(sd, dict) and (
+                    ("enc1.0.weight" in sd) or any(k.startswith("down1.conv1.") for k in sd.keys())
+                ):
+                    candidates.append(model_name_det)
+            except Exception:
+                pass
+        if not candidates:
+            raise FileNotFoundError(
+                f"UNet checkpoint not found for CAM{cam_index + 1}: model_name={model_name_unet}, det={model_name_det}"
+            )
+
+        model_path = candidates[0]
+        print(f"[CAM{cam_index + 1}] Loading UNet: {model_path}")
+        checkpoint = torch.load(model_path, map_location=_device)
+        state_dict = checkpoint if isinstance(checkpoint, dict) else checkpoint.state_dict()
+        first_key = list(state_dict.keys())[0]
+        in_channels_detected = 1
+        if "weight" in first_key:
+            in_channels_detected = state_dict[first_key].shape[1]
+        out_channels_detected = 1
+        if "out.0.weight" in state_dict:
+            out_channels_detected = state_dict["out.0.weight"].shape[0]
+        elif "out.weight" in state_dict:
+            out_channels_detected = state_dict["out.weight"].shape[0]
+        model = UNet(in_channels=in_channels_detected, out_channels=out_channels_detected).to(_device)
+        load_res = model.load_state_dict(state_dict, strict=False)
+        if load_res.missing_keys or load_res.unexpected_keys:
+            print(f"[CAM{cam_index + 1}] UNet strict=False 加载 missing={len(load_res.missing_keys)}")
+        model.eval()
+        # 与 detectoutline02 一致：UNet 分支仅传基础参数（缺陷定位仍走 function_bank 内局部对比度等逻辑）
+        M = test_one_image(
+            model=model, conduct_id=conduct_id, fukuan0=fukuan0, cut_ratio=cut_ratio,
+            img_size=img_size, seg_anomaly_thres=seg_anomaly_thres,
+            standard_ratio_x=standard_ratio_x, standard_ratio_y=standard_ratio_y, steel_real_y0=steel_real_y0,
+        )
 
     F = get_one_image_list(cut_ratio=cut_ratio, standard_ratio_x=standard_ratio_x, fukuan0=fukuan0)
     Checker = Consecutive_anomaly_Checker(thres_num=Consecutive_thres_num, calibrate_cam=calibrat_cam_id)
@@ -704,7 +858,7 @@ def detect(img, new_image_id, cam_id, strip_id, M, F, Checker, info_process, sav
                 valid_mask[ec : Hm - ec, ec : Wm - ec] = 255
                 bg_k = getattr(locator, "bg_ksize", 101)
                 diff_th = getattr(locator, "diff_threshold", 1.0)
-                from models.patchcore_model.local_contrast_defect import debug_local_contrast_visualization
+                from patchcore_model.local_contrast_defect import debug_local_contrast_visualization
 
                 debug_path = os.path.join(debug_dir, f"debug_{new_image_id}.png")
                 amap_raw_dbg = getattr(M, "_last_amap_raw", None)
@@ -774,31 +928,35 @@ def detect(img, new_image_id, cam_id, strip_id, M, F, Checker, info_process, sav
     except Exception:
         pass
 
-    lock = None
-    if cam_locks is not None:
-        lock = cam_locks[cam_id]
+    # ⚠️ 关键优化：避免把所有历史坐标/面积长期驻留在内存 list 里（会导致内存飙升到几十 GB）。
+    # - 默认 detect_coord_format=jsonl：仅写入 JSONL 增量事件流，UI 追尾读取即可。
+    # - 如需 legacy_json（兼容旧报告/工具），才继续维护 image_anomaly_center/area.json。
+    if _get_detect_coord_format() == "legacy_json":
+        lock = None
+        if cam_locks is not None:
+            lock = cam_locks[cam_id]
 
-    if lock is not None:
-        with lock:
-            image_anomaly_center_list.append(center_coords)
-            image_anomaly_area_list.append(area_list)
-            rel_center = os.path.join(strip_folder, "image_anomaly_center.json")
-            rel_area = os.path.join(strip_folder, "image_anomaly_area.json")
-            write_queue.put({
-                "type": "save_anomaly",
-                "info_process": info_process,
-                "relpath": rel_center,
-                "value": image_anomaly_center_list
-            })
-            write_queue.put({
-                "type": "save_anomaly",
-                "info_process": info_process,
-                "relpath": rel_area,
-                "value": image_anomaly_area_list
-            })
-    else:
-        info_process.save_anomaly_info(f"image_anomaly_center.json", image_anomaly_center_list)
-        info_process.save_anomaly_info(f"image_anomaly_area.json", image_anomaly_area_list)
+        if lock is not None:
+            with lock:
+                image_anomaly_center_list.append(center_coords)
+                image_anomaly_area_list.append(area_list)
+                rel_center = os.path.join(strip_folder, "image_anomaly_center.json")
+                rel_area = os.path.join(strip_folder, "image_anomaly_area.json")
+                write_queue.put({
+                    "type": "save_anomaly",
+                    "info_process": info_process,
+                    "relpath": rel_center,
+                    "value": image_anomaly_center_list
+                })
+                write_queue.put({
+                    "type": "save_anomaly",
+                    "info_process": info_process,
+                    "relpath": rel_area,
+                    "value": image_anomaly_area_list
+                })
+        else:
+            info_process.save_anomaly_info(f"image_anomaly_center.json", image_anomaly_center_list)
+            info_process.save_anomaly_info(f"image_anomaly_area.json", image_anomaly_area_list)
 
     # 幅宽写入统一由 worker 完成（Stable/Raw/Meta），避免每条带 detect() 重复 append 导致序列翻倍
 
@@ -809,7 +967,14 @@ def detect(img, new_image_id, cam_id, strip_id, M, F, Checker, info_process, sav
         )
         Hs, Ws = img.shape[:2]
         patch = crop_square_from_image_u8(img, Ws // 2, Hs // 2, DEFECT_PATCH_SIDE)
-        cv2.imwrite(save_path, patch)
+        # Windows 下 cv2.imwrite 对中文路径可能失败，改为 imencode+write
+        try:
+            ok, buf = cv2.imencode(".png", patch)
+            if ok:
+                with open(save_path, "wb") as f:
+                    f.write(buf.tobytes())
+        except Exception:
+            pass
 
     calibrate_cam_id = Checker.calibrate_cam
     cam_idx = cam_id + 1
@@ -894,52 +1059,67 @@ def receive_images(sock, cam_id, image_queue):
     单次阻塞 accept → 单连接内循环收包（4 字节小端长度 + payload），与 new 的协议相同。
     额外在循环首检查 shutdown_event，并在退出时关闭 conn，便于主程序关闭监听套接字后结束线程。
     """
+    """
+    说明：
+    - 发送端（C#/simulate）可能会断开/重连；Win 下也常见 10054 reset。
+    - 原实现 accept 一次就退出会导致「上表面/下表面某一路断线后永远不再收图」。
+    - 这里改为：外层循环持续 accept，单连接断开后回到 accept，直到 shutdown_event。
+    """
     index = 0
-    conn = None
-    try:
-        conn, address = sock.accept()
-        print(f"客户端{cam_id + 1}已连接:", address)
-        while True:
+    while not shutdown_event.is_set():
+        conn = None
+        try:
+            try:
+                conn, address = sock.accept()
+            except socket.timeout:
+                continue
+            print(f"客户端{cam_id + 1}已连接:", address)
+
+            while not shutdown_event.is_set():
+                length_bytes = conn.recv(4)
+                if not length_bytes:
+                    break
+                length = struct.unpack("I", length_bytes)[0]
+
+                image_data = b""
+                while len(image_data) < length:
+                    packet = conn.recv(length - len(image_data))
+                    if not packet:
+                        break
+                    image_data += packet
+
+                try:
+                    image_queue.put((image_data, index))
+                    # ---- 产线心跳：收到一帧就刷新（只更新内存；落盘由 _heartbeat_writer 周期写）----
+                    try:
+                        with _hb_lock:
+                            _hb_last_recv_ts[int(cam_id)] = time.time()
+                    except Exception:
+                        pass
+                    # ---- 记录输入帧率 ----
+                    _mon_r = get_monitor()
+                    if _mon_r:
+                        _mon_r.record_input(cam_id)
+                except Exception as e:
+                    print(f"Receive queue put error: {e}")
+                index += 1
+        except OSError as e:
+            # 监听套接字被关闭、或连接被 reset 时 accept/recv 可能抛出
             if shutdown_event.is_set():
                 break
-            length_bytes = conn.recv(4)
-            if not length_bytes:
+            print(f"receive_images OSError cam={cam_id}: {e}")
+            time.sleep(0.2)
+        except Exception as e:
+            if shutdown_event.is_set():
                 break
-            length = struct.unpack("I", length_bytes)[0]
-
-            image_data = b""
-            while len(image_data) < length:
-                packet = conn.recv(length - len(image_data))
-                if not packet:
-                    break
-                image_data += packet
-
-            try:
-                image_queue.put((image_data, index))
-                # ---- 产线心跳：收到一帧就刷新（只更新内存；落盘由 _heartbeat_writer 周期写）----
+            print(f"Receive error cam={cam_id}: {e}")
+            time.sleep(0.2)
+        finally:
+            if conn is not None:
                 try:
-                    with _hb_lock:
-                        _hb_last_recv_ts[int(cam_id)] = time.time()
+                    conn.close()
                 except Exception:
                     pass
-                # ---- 记录输入帧率 ----
-                _mon_r = get_monitor()
-                if _mon_r:
-                    _mon_r.record_input(cam_id)
-            except Exception as e:
-                print(f"Receive queue put error: {e}")
-            index += 1
-    except OSError as e:
-        # 监听套接字被关闭时 accept/recv 可能抛出
-        print(f"receive_images OSError cam={cam_id}: {e}")
-    except Exception as e:
-        print(f"Receive error: {e}")
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
     print(f"receive_images 线程退出 cam={cam_id}")
 
 # ------------------------- GPU图像处理线程（切分/检测与 detectoutline02.worker 对齐） -------------------------
@@ -1528,7 +1708,10 @@ if __name__ == "__main__":
     num_strips = len(fukuan0)
     print(f"[config] 检测到配置文件包含 {num_strips} 条带钢。")
 
-    folder_id_now = find_folders_with_id(base_path="D:\\detect result", product_id=conduct_id)
+    folder_id_now = find_folders_with_id(
+        base_path=os.path.join(_REPO_ROOT, "detect result"),
+        product_id=conduct_id,
+    )
     num_cams = 4
     # 仅启用 CAM2/CAM3 输出（0-based: 1,2）
     try:

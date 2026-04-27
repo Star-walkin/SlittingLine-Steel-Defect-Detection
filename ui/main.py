@@ -160,7 +160,11 @@ from matplotlib import rcParams
 
 
 def _apply_app_theme(app: QtWidgets.QApplication) -> None:
-    base_dir = os.path.dirname(os.path.abspath(__file__))
+    # 源码：与 main.py 同目录；PyInstaller onefile：theme.qss 由 spec 的 datas 置于 _MEIPASS 根目录
+    if getattr(sys, "frozen", False):
+        base_dir = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(sys.executable)))
+    else:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
     qss_path = os.path.join(base_dir, "theme.qss")
     try:
         qss = ""
@@ -243,7 +247,8 @@ class WaveformThread(QThread):
             return folder_path
 
         if now.hour < 6 and os.path.exists(yesterday_folder_path):
-            folder_path.append(today_folder_path)
+            # 夜班跨日：凌晨 0~6 点允许回看昨天目录
+            folder_path.append(yesterday_folder_path)
             return folder_path
 
         return folder_path
@@ -366,6 +371,8 @@ class ImageLoaderThread(QThread):
         self.position = pos
         self.detection_system_index = detection_system_index
         self._is_running = True
+        # 只打印一次的诊断信息（避免刷屏）
+        self._diag_once = set()
 
         # 状态记录
         self.all_coordinates = []
@@ -415,7 +422,8 @@ class ImageLoaderThread(QThread):
             return folder_path
 
         if now.hour < 6 and os.path.exists(yesterday_folder_path):
-            folder_path.append(today_folder_path)
+            # 夜班跨日：凌晨 0~6 点允许回看昨天目录
+            folder_path.append(yesterday_folder_path)
             return folder_path
 
         return folder_path
@@ -459,8 +467,22 @@ class ImageLoaderThread(QThread):
             id = config0['conduct_id']
 
             # 2. 查找文件夹
-            found_folders = self.find_folders_with_id(os.path.join(_REPO_ROOT, 'detect result'), id)
+            base_detect_dir = os.path.join(_REPO_ROOT, "detect result")
+            found_folders = self.find_folders_with_id(base_detect_dir, id)
             if len(found_folders) == 0:
+                k = ("no_root", str(id))
+                if k not in self._diag_once:
+                    self._diag_once.add(k)
+                    now = datetime.now()
+                    today_date = now.strftime('%Y%m%d')
+                    yesterday_date = (now - timedelta(days=1)).strftime('%Y%m%d')
+                    exp_today = os.path.join(base_detect_dir, today_date, str(id))
+                    exp_yday = os.path.join(base_detect_dir, yesterday_date, str(id))
+                    print(
+                        f"[UI][缺陷读取] 未找到结果目录：conduct_id={id} system={self.detection_system_index} camid={self.camid}\n"
+                        f"  - 期望(今天): {exp_today}\n"
+                        f"  - 期望(昨天): {exp_yday} (凌晨0~6点允许回看)"
+                    )
                 return
 
             root_path = found_folders[0]
@@ -474,15 +496,23 @@ class ImageLoaderThread(QThread):
             coord_file_path = os.path.join(self.folder_path, "image_anomaly_center.json")
             self.fukuan_file_path = os.path.join(self.folder_path, "fukuan.json")
             jsonl_path = os.path.join(self.folder_path, "defect_events_center.jsonl")
+            # jsonl 模式下，不能因为 legacy JSON 的“缺失/空文件”提前 return
+            if ui_coord_source != "jsonl":
+                if not os.path.exists(coord_file_path):
+                    k = ("no_coord", coord_file_path)
+                    if k not in self._diag_once:
+                        self._diag_once.add(k)
+                        print(
+                            f"[UI][缺陷读取] 坐标文件不存在，无法显示缺陷点：\n"
+                            f"  - coord_file_path: {coord_file_path}\n"
+                            f"  - jsonl_path: {jsonl_path}\n"
+                            f"  - base_folder(defect_images): {self.base_folder}"
+                        )
+                    return
 
-            if not os.path.exists(coord_file_path):
-                return
-
-            # ---【新增关键修改：防止空文件报错】---
-            if os.path.getsize(coord_file_path) == 0:
-                # 文件存在但没内容，直接跳过，等待数据写入
-                return
-            # -----------------------------------
+                # 防止空文件报错：legacy_json 模式需要等待写端填充
+                if os.path.getsize(coord_file_path) == 0:
+                    return
 
             # 读取/刷新幅宽文件（允许在坐标文件不变时仍持续增长）
             try:
@@ -577,6 +607,18 @@ class ImageLoaderThread(QThread):
                             self.detection_system_index,
                         )
                         processed += 1
+                return
+            elif ui_coord_source == "jsonl":
+                # 选择了 jsonl，但文件不存在：通常说明检测端未写 jsonl，或写到别的目录（camid/目录命名不一致）
+                k = ("no_jsonl", jsonl_path)
+                if k not in self._diag_once:
+                    self._diag_once.add(k)
+                    print(
+                        f"[UI][缺陷读取] ui_coord_source=jsonl 但未发现 jsonl 文件：\n"
+                        f"  - jsonl_path: {jsonl_path}\n"
+                        f"  - 将继续等待 jsonl 出现（不会回退到 legacy JSON）"
+                    )
+                # jsonl 模式下不要回退 legacy_json（避免一直读空的 image_anomaly_center.json）
                 return
 
             # 调试打印 (仅在路径变更时显示一次)
@@ -1987,6 +2029,11 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             self.pushButton_stop.setEnabled(bool(ok))
         except Exception:
             pass
+        # start/stop 状态变化时，同步刷新换卷按钮可用性与颜色
+        try:
+            self._refresh_exchange_enabled()
+        except Exception:
+            pass
 
     def _refresh_exchange_enabled(self):
         """
@@ -2007,7 +2054,24 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                 except Exception:
                     pass
 
-            self.button_exchange.setEnabled(bool(enabled))
+            enabled = bool(enabled)
+            self.button_exchange.setEnabled(enabled)
+            # 视觉状态：禁用时灰色，可用时恢复彩色
+            try:
+                if enabled:
+                    # 可交互：高亮、字体加粗
+                    self.button_exchange.setStyleSheet(
+                        "QPushButton{background-color:#2F80ED;color:white;border-radius:6px;font-weight:600;}"
+                        "QPushButton:hover{background-color:#256BD1;}"
+                        "QPushButton:pressed{background-color:#1F5AB2;}"
+                    )
+                else:
+                    # 不可用：灰色
+                    self.button_exchange.setStyleSheet(
+                        "QPushButton{background-color:#BDBDBD;color:#666666;border-radius:6px;font-weight:600;}"
+                    )
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -2144,8 +2208,14 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
 
     def _ensure_csharp_running(self) -> bool:
         """C# 被手动关闭后，再次点击启动应能召回。"""
-        csharp_exe = r"D:\code\DalsaGrabDemoTcp\DalsaGrabDemoTcp\MultiCamDemo\bin\Debug\MultiCamDemo.exe"
-        csharp_workdir = r"D:\code\DalsaGrabDemoTcp\DalsaGrabDemoTcp\MultiCamDemo\bin\Debug"
+        csharp_exe = os.environ.get(
+            "MULTICAM_DEMO_EXE",
+            os.path.join(_REPO_ROOT, "external", "MultiCamDemo", "MultiCamDemo.exe"),
+        )
+        csharp_workdir = os.environ.get(
+            "MULTICAM_DEMO_CWD",
+            os.path.join(_REPO_ROOT, "external", "MultiCamDemo"),
+        )
         if not os.path.exists(csharp_exe):
             QMessageBox.critical(self, "启动失败", f"未找到 C# 程序：\n{csharp_exe}")
             return False
@@ -3177,14 +3247,38 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                     self.python_process.setProcessChannelMode(QProcess.MergedChannels)
                     # 你原来只连了 StandardOutput，这里仍然走 handle_output 就够了
                     self.python_process.readyReadStandardOutput.connect(self.handle_output)
+                    # 子进程退出/错误诊断（关键：判断是否“启动即崩溃”）
+                    try:
+                        self.python_process.finished.connect(self._on_python_finished)
+                    except Exception:
+                        pass
+                    try:
+                        self.python_process.errorOccurred.connect(self._on_python_error)
+                    except Exception:
+                        pass
                     # 设置工作目录（强烈建议：相对路径/读取配置更稳定）
                     self.python_process.setWorkingDirectory(os.path.join(_REPO_ROOT))
                     # 启动
-                    self.python_process.start(python_exe, ["-u", "-m", "app.online.detect_anomalies_online"])
+                    args = ["-u", "-m", "app.online.detect_anomalies_online"]
+                    print(f"[UI] 启动检测端: {python_exe} {' '.join(args)}")
+                    print(f"[UI] 检测端工作目录: {self.python_process.workingDirectory()}")
+                    self.python_process.start(python_exe, args)
                     if not self.python_process.waitForStarted(3000):
                         QMessageBox.critical(self, "启动失败",
                                              "Python 检测程序启动失败，请检查解释器路径/脚本路径/环境依赖。")
                         return
+                    # 启动后立刻检查“结果根目录是否被创建”
+                    try:
+                        with open(os.path.join(_REPO_ROOT, "config", "config0.yaml"), "r", encoding="utf-8") as _cf:
+                            _c0 = yaml.safe_load(_cf) or {}
+                        _cid = str(_c0.get("conduct_id", "") or "")
+                        _date = datetime.now().strftime("%Y%m%d")
+                        _exp = os.path.join(os.path.join(_REPO_ROOT, "detect result"), _date, _cid)
+                        if not os.path.isdir(_exp):
+                            print(f"[UI][warn] 检测端已启动，但结果根目录尚不存在: {_exp}")
+                            print("  - 若持续不存在：通常是检测端启动即报错退出 / conduct_id 不一致 / 权限问题")
+                    except Exception:
+                        pass
 
                 # =========================
                 # 2) 启动/召回 C# 多相机程序（MultiCamDemo.exe）
@@ -3198,8 +3292,40 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                 for i in range(self.system_count):
                     fw = fukuan_values[i]
                     print(f"系统{i+1}幅宽: {fw}mm {'(激活)' if fw > 0 else '(未激活)'}")
+
+                # ---- 关键诊断：UI camid 与检测端输出目录命名必须一致 ----
+                try:
+                    with open(os.path.join(_REPO_ROOT, "config", "config.yaml"), "r", encoding="utf-8") as _f:
+                        _cfg = yaml.safe_load(_f) or {}
+                    up_id = int(_cfg.get("camrea_id_up_cls", -1))
+                    down_id = int(_cfg.get("camrea_id_down_cls", -1))
+                    # 检测端 detect_anomalies_online.py 使用 0-based CAM2/CAM3 输出为 上表面/下表面，
+                    # UI 这里的约定是 1-based：2->上表面，3->下表面
+                    if (up_id, down_id) != (2, 3):
+                        print(
+                            f"[UI][warn] 当前 camrea_id_up_cls/down_cls={up_id}/{down_id}。\n"
+                            f"  - UI 约定: 2->上表面, 3->下表面\n"
+                            f"  - 若配置不一致，UI 会去错误目录读缺陷文件，表现为“文件夹有但没缺陷信息”。"
+                        )
+                except Exception:
+                    pass
         except Exception as e:
             print(f"start_programs发生错误：{e}")
+
+    def _on_python_finished(self, exitCode, exitStatus):
+        try:
+            st = int(exitStatus)
+        except Exception:
+            st = exitStatus
+        print(f"[UI][proc] 检测端退出: exitCode={exitCode}, exitStatus={st}")
+
+    def _on_python_error(self, err):
+        # 只要触发过 errorOccurred，基本可以判定“检测端未正常运行”
+        try:
+            code = int(err)
+        except Exception:
+            code = err
+        print(f"[UI][proc] 检测端 QProcess 错误: {code}")
 
     def handle_output(self):
         data = self.python_process.readAllStandardOutput()
@@ -3221,7 +3347,7 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         try:
             list_index = system_index - 1
             # 将坐标添加到对应系统的上表面缓存（用于滑动窗口渲染）
-            file_name = self.find_file_with_coordinates(path, int(x), int(y))
+            file_name = self.find_file_with_coordinates(path, int(x), int(y)) or ""
             self.defect_points_up[list_index].append({
                 "x": float(x),
                 "y": float(y),
@@ -3229,6 +3355,15 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                 "path": path,
                 "file": file_name,
             })
+            try:
+                k = ("first_pt_up", int(system_index))
+                if not hasattr(self, "_ui_diag_once"):
+                    self._ui_diag_once = set()
+                if k not in self._ui_diag_once:
+                    self._ui_diag_once.add(k)
+                    print(f"[UI][recv] 上表面 system={system_index} 收到首个缺陷点: x={x} y={y} img='{file_name}' dir='{path}'")
+            except Exception:
+                pass
             self.cm[list_index] = c_m
             self.pos[list_index] = pos
             self.base_folder[list_index] = path
@@ -3249,7 +3384,7 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         try:
             list_index = system_index - 1
             # 将坐标添加到对应系统的下表面缓存（用于滑动窗口渲染）
-            file_name = self.find_file_with_coordinates(path, int(x), int(y))
+            file_name = self.find_file_with_coordinates(path, int(x), int(y)) or ""
             self.defect_points_down[list_index].append({
                 "x": float(x),
                 "y": float(y),
@@ -3257,6 +3392,15 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                 "path": path,
                 "file": file_name,
             })
+            try:
+                k = ("first_pt_down", int(system_index))
+                if not hasattr(self, "_ui_diag_once"):
+                    self._ui_diag_once = set()
+                if k not in self._ui_diag_once:
+                    self._ui_diag_once.add(k)
+                    print(f"[UI][recv] 下表面 system={system_index} 收到首个缺陷点: x={x} y={y} img='{file_name}' dir='{path}'")
+            except Exception:
+                pass
             self.cm2[list_index] = c_m
             self.pos2[list_index] = pos
             self.base_folder2[list_index] = path
@@ -3591,6 +3735,8 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
 
     def display_image_up(self, folder_path, file_name,  system_index):
         try:
+            if not folder_path or not file_name:
+                return
             realtime_labels = self._up_realtime_labels()
             label = realtime_labels[system_index]
             # 显示选中的图片
@@ -3609,6 +3755,8 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
 
     def display_image_down(self, folder_path, file_name,  system_index):
         try:
+            if not folder_path or not file_name:
+                return
             realtime_labels = self._down_realtime_labels()
             label = realtime_labels[system_index]
             # 显示选中的图片
@@ -3627,6 +3775,8 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
 
     def display_image2_up(self, folder_path, file_name, system_index):
         try:
+            if not folder_path or not file_name:
+                return
             if not os.path.exists(folder_path):
                 print(f"文件夹不存在: {folder_path}")
                 return
@@ -3672,6 +3822,8 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
 
     def display_image2_down(self, folder_path, file_name, system_index):
         try:
+            if not folder_path or not file_name:
+                return
             if not os.path.exists(folder_path):
                 print(f"文件夹不存在: {folder_path}")
                 return
