@@ -122,14 +122,14 @@ print_cls:
 - 3
 - 4
 - 5
-product_cls: '4'
+product_cls: '1'
 product_cls_names:
   '1': 316L
   '2': '301'
   '3': '321'
   '4': '304'
-rptcfg_revision: 276
-rptcfg_updated_at: '2026-04-15 09:04:22'
+rptcfg_revision: 294
+rptcfg_updated_at: '2026-04-27 23:57:31'
 rptcfg_updated_by: DESKTOP-NSH13CD
 steel_length_range: []
 strip_id: '1'

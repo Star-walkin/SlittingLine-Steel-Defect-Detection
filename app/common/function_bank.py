@@ -318,6 +318,21 @@ class test_one_image(torch.nn.Module):
         self.bg_ksize = int(bg_ksize)
         self.diff_threshold = float(diff_threshold)
 
+        # ===== 缺陷小图保存限流（避免磁盘/CPU被写盘拖垮）=====
+        # 说明：
+        # - 缺陷“检测结果”（坐标/面积）始终会产生并写入 jsonl
+        # - defect_images 小图保存是可控的：按面积阈值 + 每帧/每分钟限额 + 目录保留上限
+        self.save_defect_images_enable = True
+        self.save_defect_images_min_area = 0          # 0 表示不按面积过滤
+        self.save_defect_images_max_per_frame = 12    # 单帧最多保存多少张小图
+        self.save_defect_images_max_per_minute = 240  # 每分钟最多保存多少张小图（防爆盘）
+        self.save_defect_images_keep_last_n = 2000    # 每个 strip 的 defect_images 最多保留多少张
+        self._save_bucket_start_ts = 0.0
+        self._save_bucket_count = 0
+        self._save_frame_count = 0
+        self._save_cleanup_every = 40
+        self._save_since_cleanup = 0
+
         # [修改 1] 适配单通道模型的 Transform
         self.transform_test = transforms.Compose([
             transforms.Resize((self.img_size, self.img_size)),
@@ -329,14 +344,22 @@ class test_one_image(torch.nn.Module):
         self.get_method = get_one_image_list(self.cut_ratio, self.standard_ratio_x, self.fukuan0)
 
         # ===== GPU 推理加速设置 =====
-        self.model = self.model.cuda()
+        # 旧逻辑强制 .cuda() 会在无 GPU / 驱动异常时直接崩溃。
+        # 这里根据实际可用设备选择 cuda/cpu，保证系统“能跑且不炸”。
+        try:
+            use_cuda = torch.cuda.is_available() and int(torch.cuda.device_count() or 0) > 0
+        except Exception:
+            use_cuda = False
+        self.device = torch.device("cuda" if use_cuda else "cpu")
+        self.model = self.model.to(self.device)
         self.model.eval()
 
         self.msgm = MSGMSLoss(in_channels=1)
 
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
+        if self.device.type == "cuda":
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
 
     def concatenate_images_vertical(self, tiles):
         if isinstance(tiles, list):
@@ -490,6 +513,26 @@ class test_one_image(torch.nn.Module):
         返回是否成功写出文件。
         """
         out_path = os.path.join(anomaly_save_path, save_name)
+        # Windows 下 OpenCV 的 imwrite 对中文路径不稳定（可能静默失败）。
+        # 统一用 “imencode + open(..., wb)” 的方式写盘，保证中文路径可用。
+        def _safe_write_image(path: str, img_arr) -> bool:
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+            except Exception:
+                pass
+            try:
+                ext = os.path.splitext(path)[1].lower() or ".png"
+                if ext not in (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"):
+                    ext = ".png"
+                    path = path + ".png"
+                ok, buf = cv2.imencode(ext, img_arr)
+                if not ok:
+                    return False
+                with open(path, "wb") as f:
+                    f.write(buf.tobytes())
+                return True
+            except Exception:
+                return False
         mode = getattr(self, "_last_detect_mode", "tiled")
         # SlidingWindowDetector：整幅条带 crop 一次性 resize 成 test_cut，与 tile 拼接不同
         if (
@@ -503,8 +546,7 @@ class test_one_image(torch.nn.Module):
                 cx_s = cut_l + (float(cx) / float(out_W)) * float(cW)
                 cy_s = (float(cy) / float(out_H)) * float(cH)
                 patch = crop_square_from_image_u8(original_strip_for_crop, cx_s, cy_s, DEFECT_PATCH_SIDE)
-                cv2.imwrite(out_path, patch)
-                return True
+                return _safe_write_image(out_path, patch)
         tiles_u8 = getattr(self, "_last_tiles_u8", None)
         cut_l = getattr(self, "_last_cut_l", 0)
         S = self.img_size
@@ -515,8 +557,7 @@ class test_one_image(torch.nn.Module):
         ):
             cx_s, cy_s = map_model_space_xy_to_strip_xy(float(cx), float(cy), tiles_u8, S, cut_l)
             patch = crop_square_from_image_u8(original_strip_for_crop, cx_s, cy_s, DEFECT_PATCH_SIDE)
-            cv2.imwrite(out_path, patch)
-            return True
+            return _safe_write_image(out_path, patch)
 
         H, W = test_img.shape[:2]
         crop_size = fallback_crop_size
@@ -541,8 +582,73 @@ class test_one_image(torch.nn.Module):
             cropped = np.squeeze(cropped, axis=2)
         elif cropped.ndim != 2 and cropped.shape[2] != 3:
             cropped = cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY)
-        Image.fromarray(cropped.astype(np.uint8)).save(out_path)
-        return True
+        # PIL 的 save 对中文路径也稳定，但这里仍统一走 safe_write，避免不同分支行为差异
+        try:
+            cropped_u8 = cropped.astype(np.uint8)
+        except Exception:
+            cropped_u8 = cropped
+        return _safe_write_image(out_path, cropped_u8)
+
+    def _maybe_cleanup_defect_images(self, defect_dir: str) -> None:
+        """按保留上限清理最旧的 defect_images，避免长期运行爆盘。"""
+        try:
+            keep_n = int(getattr(self, "save_defect_images_keep_last_n", 0) or 0)
+            if keep_n <= 0:
+                return
+            if self._save_since_cleanup < int(getattr(self, "_save_cleanup_every", 40) or 40):
+                return
+            self._save_since_cleanup = 0
+            if not os.path.isdir(defect_dir):
+                return
+            files = []
+            for fn in os.listdir(defect_dir):
+                if not fn.lower().endswith((".png", ".jpg", ".jpeg", ".bmp")):
+                    continue
+                fp = os.path.join(defect_dir, fn)
+                try:
+                    st = os.stat(fp)
+                except Exception:
+                    continue
+                files.append((st.st_mtime, fp))
+            if len(files) <= keep_n:
+                return
+            files.sort(key=lambda x: x[0])  # oldest first
+            for _, fp in files[: max(0, len(files) - keep_n)]:
+                try:
+                    os.remove(fp)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _should_save_defect_patch(self, real_area: int) -> bool:
+        """面积阈值 + 每帧/每分钟限流。"""
+        try:
+            if not bool(getattr(self, "save_defect_images_enable", True)):
+                return False
+            min_area = int(getattr(self, "save_defect_images_min_area", 0) or 0)
+            if min_area > 0 and int(real_area) < min_area:
+                return False
+            # per-frame
+            mx_frame = int(getattr(self, "save_defect_images_max_per_frame", 0) or 0)
+            if mx_frame > 0 and int(getattr(self, "_save_frame_count", 0) or 0) >= mx_frame:
+                return False
+            # per-minute
+            mx_min = int(getattr(self, "save_defect_images_max_per_minute", 0) or 0)
+            if mx_min > 0:
+                import time as _t
+                now = float(_t.time())
+                if not (self._save_bucket_start_ts > 0):
+                    self._save_bucket_start_ts = now
+                    self._save_bucket_count = 0
+                if now - float(self._save_bucket_start_ts) >= 60.0:
+                    self._save_bucket_start_ts = now
+                    self._save_bucket_count = 0
+                if int(self._save_bucket_count) >= mx_min:
+                    return False
+            return True
+        except Exception:
+            return True
 
     def obtain_anomaly_location(self, amap, test_img, anomaly_save_path, image_id, fukuan=None, original_strip_for_crop=None):
         """
@@ -554,6 +660,11 @@ class test_one_image(torch.nn.Module):
             JSON 中的 real_x：cx 按热力图宽度 Wm 线性映射到幅宽 mm；real_y：cy 按高度 Hm 映射，与像素裁剪独立。
         """
         center_coords, area_list = [], []
+        # 新的一帧：重置本帧写盘计数
+        try:
+            self._save_frame_count = 0
+        except Exception:
+            pass
         # amap 与 test_cut：纵向为 cut_ratio 个 tile 拼接 → 高 Hm = img_size*cut_ratio，宽 Wm = img_size。
         # 幅宽方向 cx 只应除以 Wm；误用 (img_size*cut_ratio) 会把 real_x 压窄到约 fukuan/cut_ratio。
         Hm, Wm = int(amap.shape[0]), int(amap.shape[1])
@@ -605,18 +716,24 @@ class test_one_image(torch.nn.Module):
                              + self.steel_real_y0)
 
                 save_name = f"{real_x}_{real_y}_{real_area}_img{image_id}.png"
-                if not self._save_defect_patch_from_detection(
-                    anomaly_save_path,
-                    save_name,
-                    test_img,
-                    cx,
-                    cy,
-                    32,
-                    original_strip_for_crop,
-                ):
-                    continue
+                # 坐标/面积始终记录（保证“所有缺陷都保存信息”）
                 area_list.append(real_area)
                 center_coords.append((real_x, real_y))
+                # 小图保存受控（避免炸盘/炸CPU）
+                if self._should_save_defect_patch(real_area):
+                    if self._save_defect_patch_from_detection(
+                        anomaly_save_path,
+                        save_name,
+                        test_img,
+                        cx,
+                        cy,
+                        32,
+                        original_strip_for_crop,
+                    ):
+                        self._save_frame_count += 1
+                        self._save_bucket_count += 1
+                        self._save_since_cleanup += 1
+                        self._maybe_cleanup_defect_images(anomaly_save_path)
             return 1 if len(center_coords) > 0 else 0, center_coords, area_list
 
         # ---------- 回退：局部对比度模块不可用时保留原逻辑 ----------
@@ -655,18 +772,22 @@ class test_one_image(torch.nn.Module):
                 real_y = int(4096 * self.standard_ratio_y *
                              (cy / Hf + image_id) + self.steel_real_y0)
                 save_name = f"{real_x}_{real_y}_{real_area}_img{image_id}.png"
-                if not self._save_defect_patch_from_detection(
-                    anomaly_save_path,
-                    save_name,
-                    test_img,
-                    cx,
-                    cy,
-                    128,
-                    original_strip_for_crop,
-                ):
-                    continue
                 area_list.append(real_area)
                 center_coords.append((real_x, real_y))
+                if self._should_save_defect_patch(real_area):
+                    if self._save_defect_patch_from_detection(
+                        anomaly_save_path,
+                        save_name,
+                        test_img,
+                        cx,
+                        cy,
+                        128,
+                        original_strip_for_crop,
+                    ):
+                        self._save_frame_count += 1
+                        self._save_bucket_count += 1
+                        self._save_since_cleanup += 1
+                        self._maybe_cleanup_defect_images(anomaly_save_path)
             return 1 if len(center_coords) > 0 else 0, center_coords, area_list
         if amap.mean() > self.seg_anomaly_thres + 0.05:
             cx = test_img.shape[1] // 2
@@ -718,18 +839,22 @@ class test_one_image(torch.nn.Module):
                          (cy / Hf + image_id)
                          + self.steel_real_y0)
             save_name = f"{real_x}_{real_y}_{real_area}_img{image_id}.png"
-            if not self._save_defect_patch_from_detection(
-                anomaly_save_path,
-                save_name,
-                test_img,
-                cx,
-                cy,
-                128,
-                original_strip_for_crop,
-            ):
-                continue
             area_list.append(real_area)
             center_coords.append((real_x, real_y))
+            if self._should_save_defect_patch(real_area):
+                if self._save_defect_patch_from_detection(
+                    anomaly_save_path,
+                    save_name,
+                    test_img,
+                    cx,
+                    cy,
+                    128,
+                    original_strip_for_crop,
+                ):
+                    self._save_frame_count += 1
+                    self._save_bucket_count += 1
+                    self._save_since_cleanup += 1
+                    self._maybe_cleanup_defect_images(anomaly_save_path)
 
         return 1 if len(center_coords) > 0 else 0, center_coords, area_list
 
@@ -1666,6 +1791,46 @@ class Anomaly_info_List:
                         print(f"[ERROR] 读取 {p} 出错: {e}")
             return None
 
+        def _maybe_load_from_jsonl(base_dir, listname):
+            """
+            当 legacy JSON 不存在时，从 JSONL 事件流聚合为旧结构返回。
+            - image_anomaly_center.json -> defect_events_center.jsonl
+            结构：list[frame_points]，其中 frame_points = [[x,y], ...]
+            """
+            try:
+                ln = str(listname or "")
+                if "image_anomaly_center" in ln:
+                    jsonl = os.path.join(base_dir, "defect_events_center.jsonl")
+                else:
+                    return None
+                if not os.path.exists(jsonl):
+                    return None
+                out = []
+                with open(jsonl, "r", encoding="utf-8") as f:
+                    for line in f:
+                        s = line.strip()
+                        if not s:
+                            continue
+                        try:
+                            ev = json.loads(s)
+                        except Exception:
+                            continue
+                        pts = ev.get("points", [])
+                        if not isinstance(pts, list):
+                            continue
+                        frame = []
+                        for p in pts:
+                            try:
+                                x, y = p
+                                frame.append([float(x), float(y)])
+                            except Exception:
+                                continue
+                        if frame:
+                            out.append(frame)
+                return out
+            except Exception:
+                return None
+
         # ---------- 单带钢原始逻辑（保留） ----------
         if not self.multi_strip:
             candidates = [
@@ -1676,7 +1841,9 @@ class Anomaly_info_List:
             ]
             loaded = _try_load_file(candidates)
             if loaded is None:
-                return []
+                # JSONL 回退（仅 center 事件流）
+                fallback = _maybe_load_from_jsonl(self.filepath, listname)
+                return fallback if fallback is not None else []
             return loaded
 
         # ---------- multi_strip=True 时的智能逻辑 ----------
@@ -1694,8 +1861,8 @@ class Anomaly_info_List:
             ]
             loaded = _try_load_file(candidates)
             if loaded is None:
-                # 无文件时返回空列表（保持与单带钢返回类型一致）
-                return []
+                fallback = _maybe_load_from_jsonl(fp, listname)
+                return fallback if fallback is not None else []
             return loaded
 
         # 否则把 filepath 当作 CAM 目录，遍历其下的 strip_ 子文件夹
@@ -1718,7 +1885,8 @@ class Anomaly_info_List:
             ]
             loaded = _try_load_file(candidates)
             if loaded is None:
-                return {}
+                fallback = _maybe_load_from_jsonl(fp, listname)
+                return {basename: fallback} if fallback is not None else {}
             # 返回一个单元素字典，键使用 basename（CAM 名）以便上层处理一致性
             return {basename: loaded}
 
@@ -1733,7 +1901,8 @@ class Anomaly_info_List:
             ]
             loaded = _try_load_file(candidates)
             if loaded is None:
-                all_data[sub] = []
+                fallback = _maybe_load_from_jsonl(strip_dir, listname)
+                all_data[sub] = fallback if fallback is not None else []
             else:
                 all_data[sub] = loaded
 
