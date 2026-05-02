@@ -1,16 +1,33 @@
-from PyQt5 import QtWidgets, QtCore
-from PyQt5.QtWidgets import QInputDialog, QMessageBox, QLineEdit, QComboBox
-from PyQt5.QtGui import QPixmap, QPainter, QPen, QFont, QFontMetrics
-from PyQt5.QtCore import QRect, Qt, QTimer, QThread, pyqtSignal, QProcess
-from PyQt5.QtWidgets import (
-    QApplication,
-    QWidget,
-    QLabel,
-    QPushButton,
-    QHBoxLayout,
-    QVBoxLayout,
-    QSizePolicy,
-)
+try:
+    # 优先使用 PyQt5（原工程依赖）
+    from PyQt5 import QtWidgets, QtCore
+    from PyQt5.QtWidgets import QInputDialog, QMessageBox, QLineEdit, QComboBox
+    from PyQt5.QtGui import QPixmap, QPainter, QPen, QFont, QFontMetrics, QDesktopServices
+    from PyQt5.QtCore import QRect, Qt, QTimer, QThread, pyqtSignal, QProcess, QEvent, QUrl
+    from PyQt5.QtWidgets import (
+        QApplication,
+        QWidget,
+        QLabel,
+        QPushButton,
+        QHBoxLayout,
+        QVBoxLayout,
+        QSizePolicy,
+    )
+except ModuleNotFoundError:
+    # 兼容：未安装 PyQt5 时自动回退 PySide6
+    from PySide6 import QtWidgets, QtCore
+    from PySide6.QtWidgets import QInputDialog, QMessageBox, QLineEdit, QComboBox
+    from PySide6.QtGui import QPixmap, QPainter, QPen, QFont, QFontMetrics, QDesktopServices
+    from PySide6.QtCore import QRect, Qt, QTimer, QThread, Signal as pyqtSignal, QProcess, QEvent, QUrl
+    from PySide6.QtWidgets import (
+        QApplication,
+        QWidget,
+        QLabel,
+        QPushButton,
+        QHBoxLayout,
+        QVBoxLayout,
+        QSizePolicy,
+    )
 from mainui import Ui_MainWindow  # 导入pyuic生成的类
 from para import ParaWindow
 from report_change import ReportWindow
@@ -35,9 +52,66 @@ import numpy as np
 import math
 from datetime import timedelta, datetime
 
+_PROJECT_ROOT = os.path.join(_REPO_ROOT)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+import strip_result_paths as _strip_paths
+
 _AUTH_CONFIG_PATH = os.path.join(_REPO_ROOT, "config", "auth.yaml")
 _RUNTIME_STATE_PATH = os.path.join(_REPO_ROOT, "config", "runtime_state.json")
 _LINE_HEARTBEAT_PATH = os.path.join(_REPO_ROOT, "config", "line_heartbeat.json")
+
+
+def _ui_strip_dir_basename_for_roll(result_roll_path: str, detection_system_index: int) -> str:
+    """把 UI 的条带序号(1..N)解析为 detect result 内实际条带目录名（与写端 strip_dir_list 对齐）。"""
+    try:
+        sid = int(detection_system_index)
+    except Exception:
+        sid = 1
+    if sid < 1:
+        sid = 1
+    try:
+        return _strip_paths.resolve_strip_dir_basename(str(result_roll_path or ""), sid)
+    except Exception:
+        return f"strip_{sid}"
+
+
+def _clamp_strip_count_ui(n: int) -> int:
+    return min(4, max(1, int(n)))
+
+
+def _truth_strip_index_1based(ui_slot_1based: int, strip_count: int) -> int:
+    """
+    UI：从左到右输入依次为 1..n（与界面控件从左到右一致）。
+    物理/算法：仍保持「图像从左到右依次为 1..n」不变（不写检测端）。
+
+    需求：UI 左起第 k 个输入对应图像中从右数第 k 条带 =>
+    UI 槽位 ui(1..n) 映射到物理序号 truth = n - ui + 1。
+    """
+    n = _clamp_strip_count_ui(strip_count)
+    try:
+        ui = int(ui_slot_1based)
+    except Exception:
+        ui = 1
+    ui = max(1, min(n, ui))
+    return n - ui + 1
+
+
+def _open_image_path_with_system_viewer(path: str) -> bool:
+    """用系统默认关联程序打开本地图像文件（Windows 优先 os.startfile）。"""
+    p = os.path.normpath(str(path or ""))
+    if not p or not os.path.isfile(p):
+        return False
+    try:
+        if os.name == "nt":
+            os.startfile(p)
+            return True
+    except Exception:
+        pass
+    try:
+        return bool(QDesktopServices.openUrl(QUrl.fromLocalFile(p)))
+    except Exception:
+        return False
 
 
 def _write_runtime_state(paused: bool) -> None:
@@ -292,7 +366,9 @@ class WaveformThread(QThread):
             with open(os.path.join(_REPO_ROOT, 'config', 'config0.yaml'), 'r', encoding='utf-8') as file:
                 config0 = yaml.safe_load(file)
 
-            fukuan_key = f"fukuan_{self.detection_system_index}"
+            n = _clamp_strip_count_ui(int(config0.get("strip_count", 3) or 3))
+            truth = _truth_strip_index_1based(self.detection_system_index, n)
+            fukuan_key = f"fukuan_{truth}"
             baseline_width = config0.get(fukuan_key, 0)
 
             if baseline_width <= 0:
@@ -307,8 +383,8 @@ class WaveformThread(QThread):
 
             root_path = found_folders[0]
             cam_folder = self._cam_folder_name_from_id(self.camid)
-            self.fukuan_path = root_path + "/" + str(cam_folder) + "/" + "strip_" + str(
-                self.detection_system_index) + "/"
+            strip_base = _ui_strip_dir_basename_for_roll(root_path, truth)
+            self.fukuan_path = os.path.join(root_path, str(cam_folder), strip_base) + os.sep
             new_folder_name = "fukuan.json"
 
             self.path = os.path.join(self.fukuan_path, new_folder_name)
@@ -458,7 +534,9 @@ class ImageLoaderThread(QThread):
             # 1. 读取配置
             with open(os.path.join(_REPO_ROOT, 'config', 'config0.yaml'), 'r', encoding='utf-8') as file:
                 config0 = yaml.safe_load(file)
-                fukuan_key = f"fukuan_{self.detection_system_index}"
+                n = _clamp_strip_count_ui(int(config0.get("strip_count", 3) or 3))
+                truth = _truth_strip_index_1based(self.detection_system_index, n)
+                fukuan_key = f"fukuan_{truth}"
                 baseline_width = config0.get(fukuan_key, 0)
                 if baseline_width <= 0:
                     return
@@ -487,8 +565,8 @@ class ImageLoaderThread(QThread):
 
             root_path = found_folders[0]
             cam_folder = self._cam_folder_name_from_id(self.camid)
-            self.folder_path = root_path + "/" + str(cam_folder) + "/" + "strip_" + str(
-                self.detection_system_index) + "/"
+            strip_base = _ui_strip_dir_basename_for_roll(root_path, truth)
+            self.folder_path = os.path.join(root_path, str(cam_folder), strip_base) + os.sep
             new_folder_name = "defect_images"
             self.base_folder = os.path.join(self.folder_path, new_folder_name)
 
@@ -711,6 +789,10 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.system_count = 3
         self._load_system_count_from_config()
         self.MAX_STRIPS = 4
+        # 各条带最近一次在界面显示的缺陷图完整路径（用于双击用系统看图软件打开）
+        self._preview_image_path_up = [None] * self.MAX_STRIPS
+        self._preview_image_path_down = [None] * self.MAX_STRIPS
+        self._production_nav_filter_installed = False
         self.buttons = [[] for _ in range(self.MAX_STRIPS)] # 存储生成的按钮
         self.buttons2 = [[] for _ in range(self.MAX_STRIPS)]
         self.coordinate_queue = [[] for _ in range(self.MAX_STRIPS)]  # 队列用于存储待处理的坐标
@@ -817,7 +899,10 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self._init_scrollable_strip_layout()
         self._init_external_axis_canvases()
         self.apply_strip_layout(self.system_count)
+        self._hydrate_production_inputs_from_config0()
         self._setup_fukuan_status_panel()
+        self._install_production_focus_navigation()
+        self._install_detection_image_double_click_open()
 
     def _fukuan_status_title_labels(self):
         titles = [self.label_title_15, self.label_title_7, self.label_title_10]
@@ -1018,6 +1103,240 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             self.strip_count_combo.setCurrentText(str(self.system_count))
             self.strip_count_combo.blockSignals(False)
 
+    def _hydrate_production_inputs_from_config0(self):
+        """从 config0 按物理条带读入，再映射到 UI 左→右槽位（与 save_config01 写入对称）。"""
+        cfg_path = os.path.join(_REPO_ROOT, "config", "config0.yaml")
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                c = yaml.safe_load(f) or {}
+        except Exception:
+            return
+        n = _clamp_strip_count_ui(int(c.get("strip_count", getattr(self, "system_count", 3)) or 3))
+        prev = int(getattr(self, "system_count", n))
+        self.system_count = n
+        if hasattr(self, "strip_count_combo"):
+            self.strip_count_combo.blockSignals(True)
+            self.strip_count_combo.setCurrentText(str(n))
+            self.strip_count_combo.blockSignals(False)
+        if prev != n:
+            try:
+                self.apply_strip_layout(n)
+            except Exception:
+                pass
+        if hasattr(self, "conduct_id"):
+            self.conduct_id.setText(str(c.get("conduct_id", "") or "").strip())
+        for ui_slot in range(1, 5):
+            fe = getattr(self, f"fukuan_{ui_slot}", None)
+            if fe is None:
+                continue
+            if ui_slot <= n:
+                truth = _truth_strip_index_1based(ui_slot, n)
+                raw = c.get(f"fukuan_{truth}", 0)
+                try:
+                    x = float(raw or 0)
+                except (TypeError, ValueError):
+                    x = 0.0
+                if x <= 0:
+                    fe.setText("")
+                else:
+                    fe.setText(str(int(x)) if x == int(x) else str(x))
+            else:
+                fe.setText("")
+        if hasattr(self, "strip_card_edits"):
+            for idx, ed in enumerate(self.strip_card_edits):
+                ui_slot = idx + 1
+                if ui_slot <= n:
+                    truth = _truth_strip_index_1based(ui_slot, n)
+                    ed.setText(str(c.get(f"strip_card_{truth}", "") or "").strip())
+                else:
+                    ed.setText("")
+
+    def _production_focus_chain_widgets(self):
+        """质保书号 → 幅宽1→卡号1→幅宽2→卡号2…（仅当前条数下可见框，符合从左到右、先幅宽后卡号的填写习惯）。"""
+        chain = []
+        if hasattr(self, "conduct_id"):
+            chain.append(self.conduct_id)
+        n = self._visible_count()
+        for i in range(n):
+            fw = getattr(self, f"fukuan_{i + 1}", None)
+            if fw is not None:
+                chain.append(fw)
+            if hasattr(self, "strip_card_edits") and i < len(self.strip_card_edits):
+                chain.append(self.strip_card_edits[i])
+        return chain
+
+    def _setup_production_tab_order(self):
+        """仅串联质保书号与幅宽、卡号之间的 Tab 顺序（Shift+Tab 反向）。"""
+        chain = self._production_focus_chain_widgets()
+        if len(chain) < 2:
+            return
+        for i in range(len(chain) - 1):
+            try:
+                self.setTabOrder(chain[i], chain[i + 1])
+            except Exception:
+                pass
+
+    def _refresh_production_field_focus_policy(self):
+        """隐藏条对应的幅宽/卡号不参与焦点，避免 Tab 误入未启用列。"""
+        n = self._visible_count()
+        if hasattr(self, "conduct_id"):
+            self.conduct_id.setFocusPolicy(Qt.StrongFocus)
+        for i in range(1, 5):
+            w = getattr(self, f"fukuan_{i}", None)
+            if w is None:
+                continue
+            w.setFocusPolicy(Qt.StrongFocus if i <= n else Qt.NoFocus)
+        if hasattr(self, "strip_card_edits"):
+            for j, ed in enumerate(self.strip_card_edits, start=1):
+                ed.setFocusPolicy(Qt.StrongFocus if j <= n else Qt.NoFocus)
+
+    def _install_production_focus_navigation(self):
+        widgets = []
+        if hasattr(self, "conduct_id"):
+            widgets.append(self.conduct_id)
+        for i in range(1, 5):
+            w = getattr(self, f"fukuan_{i}", None)
+            if w is not None:
+                widgets.append(w)
+        if hasattr(self, "strip_card_edits"):
+            widgets.extend(self.strip_card_edits)
+        if not self._production_nav_filter_installed:
+            for w in widgets:
+                try:
+                    w.installEventFilter(self)
+                except Exception:
+                    pass
+            self._production_nav_filter_installed = True
+        self._refresh_production_field_focus_policy()
+        self._setup_production_tab_order()
+
+    def _production_focus_prev_next(self, current, delta):
+        chain = self._production_focus_chain_widgets()
+        if not chain:
+            return False
+        try:
+            i = chain.index(current)
+        except ValueError:
+            return False
+        j = (i + delta) % len(chain)
+        chain[j].setFocus()
+        try:
+            if isinstance(chain[j], QLineEdit):
+                chain[j].selectAll()
+        except Exception:
+            pass
+        return True
+
+    @staticmethod
+    def _lineedit_at_left_boundary(le):
+        if le.selectedText():
+            return le.selectionStart() == 0
+        return le.cursorPosition() <= 0
+
+    @staticmethod
+    def _lineedit_at_right_boundary(le):
+        t = le.text()
+        ln = len(t)
+        if le.selectedText():
+            return le.selectionStart() + len(le.selectedText()) >= ln
+        return le.cursorPosition() >= ln
+
+    def _defect_image_label_strip_index(self, obj):
+        """若为缺陷/实时图相关 QLabel，返回 ('up'|'down', strip_idx)；否则 None。"""
+        for i, lb in enumerate(self._up_show_labels()):
+            if obj is lb:
+                return "up", i
+        for i, lb in enumerate(self._down_show_labels()):
+            if obj is lb:
+                return "down", i
+        for i, lb in enumerate(self._up_realtime_labels()):
+            if obj is lb:
+                return "up", i
+        for i, lb in enumerate(self._down_realtime_labels()):
+            if obj is lb:
+                return "down", i
+        for i, lb in enumerate(self._up_click_labels()):
+            if obj is lb:
+                return "up", i
+        for i, lb in enumerate(self._down_click_labels()):
+            if obj is lb:
+                return "down", i
+        return None
+
+    def _resolve_double_click_defect_image_path(self, surface, strip_idx):
+        prev = (
+            self._preview_image_path_up if surface == "up" else self._preview_image_path_down
+        )
+        p = prev[strip_idx] if 0 <= strip_idx < len(prev) else None
+        if p and os.path.isfile(p):
+            return p
+        pts = self.defect_points_up if surface == "up" else self.defect_points_down
+        if 0 <= strip_idx < len(pts):
+            for pt in reversed(pts[strip_idx]):
+                base = (pt.get("path") or "").strip()
+                fn = (pt.get("file") or "").strip()
+                if base and fn:
+                    fp = os.path.normpath(os.path.join(base, fn))
+                    if os.path.isfile(fp):
+                        return fp
+        return None
+
+    def _install_detection_image_double_click_open(self):
+        targets = []
+        try:
+            targets.extend(self._up_show_labels())
+            targets.extend(self._down_show_labels())
+            targets.extend(self._up_realtime_labels())
+            targets.extend(self._down_realtime_labels())
+            targets.extend(self._up_click_labels())
+            targets.extend(self._down_click_labels())
+        except Exception:
+            return
+        for lb in targets:
+            if lb is None:
+                continue
+            try:
+                lb.installEventFilter(self)
+            except Exception:
+                pass
+
+    def eventFilter(self, obj, event):
+        try:
+            et = event.type()
+        except Exception:
+            return False
+        if et == QEvent.MouseButtonDblClick:
+            hit = self._defect_image_label_strip_index(obj)
+            if hit is not None:
+                surface, strip_idx = hit
+                img_path = self._resolve_double_click_defect_image_path(surface, strip_idx)
+                if img_path and _open_image_path_with_system_viewer(img_path):
+                    return True
+                return False
+        if et == QEvent.KeyPress and isinstance(obj, QLineEdit):
+            try:
+                if obj not in self._production_focus_chain_widgets():
+                    return False
+            except Exception:
+                return False
+            key = event.key()
+            if key in (Qt.Key_Down, Qt.Key_Up):
+                d = 1 if key == Qt.Key_Down else -1
+                if self._production_focus_prev_next(obj, d):
+                    return True
+                return False
+            if key == Qt.Key_Right:
+                if self._lineedit_at_right_boundary(obj):
+                    if self._production_focus_prev_next(obj, 1):
+                        return True
+                return False
+            if key == Qt.Key_Left:
+                if self._lineedit_at_left_boundary(obj):
+                    if self._production_focus_prev_next(obj, -1):
+                        return True
+                return False
+        return False
+
     def _layout_production_config_strip(self):
         """
         顶部生产配置区栅格布局：消除 4 条幅宽与产品型号重叠；
@@ -1053,7 +1372,7 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.label_ID.setAlignment(Qt.AlignLeft | Qt.AlignBottom)
         self.conduct_id.setGeometry(_R(conduct_x, row2_y, conduct_w, row2_h))
 
-        # 幅宽：主标签与右侧说明「由西向东…」分列，避免与首列幅宽输入重叠
+        # 幅宽：主标签与右侧说明「从东向西…」分列，避免与首列幅宽输入重叠
         self.label_ID_6.setGeometry(_R(fukuan_x0, row1_y, 76, row1_h))
         self.label_ID_6.setAlignment(Qt.AlignLeft | Qt.AlignBottom)
         if hasattr(self, "label_fukuan_order_hint"):
@@ -1133,12 +1452,12 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         try:
             self.label_ID_6.setText("幅宽及卡号")
             self.label_ID_6.setToolTip("请在下方填写各条带钢的幅宽与对应带钢卡号（与条数一一对应）。")
-            self.label_fukuan_order_hint = QLabel("（由西向东顺序依次输入）", self.frame)
+            self.label_fukuan_order_hint = QLabel("（从东向西顺序依次输入）", self.frame)
             self.label_fukuan_order_hint.setStyleSheet(
                 "QLabel { color: #5a5a5a; font: 12px 'Arial'; background: transparent; border: none; }"
             )
             self.label_fukuan_order_hint.setToolTip(
-                "幅宽1、幅宽2…与带钢卡号1、2…按产线由西向东的顺序一一对应填写。"
+                "幅宽1、幅宽2…与带钢卡号1、2…按产线从东向西的顺序一一对应填写。"
             )
         except Exception:
             pass
@@ -1547,6 +1866,12 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             self._apply_strip_card_titles(cards)
         except Exception:
             pass
+        if getattr(self, "_production_nav_filter_installed", False):
+            try:
+                self._refresh_production_field_focus_policy()
+                self._setup_production_tab_order()
+            except Exception:
+                pass
 
     @staticmethod
     def _format_vertical_card_text(s: str, max_chars: int = 6) -> str:
@@ -1910,20 +2235,29 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                     QMessageBox.warning(self, "输入错误", f"第{i+1}条带钢已填写幅宽，但带钢卡号为空。请补充带钢卡号{i+1}。")
                     return
 
+            # UI 左->右 与 物理(图像左->右) 的输入映射：仅在此处重排写入 config0，检测端算法不变
+            n = int(self.system_count)
+            phys_fw = [0.0, 0.0, 0.0, 0.0]
+            phys_card = ["", "", "", ""]
+            for ui_slot in range(1, n + 1):
+                p = _truth_strip_index_1based(ui_slot, n)
+                phys_fw[p - 1] = float(fws[ui_slot - 1])
+                phys_card[p - 1] = str(strip_cards[ui_slot - 1] or "").strip()
+
             # 创建字典
             data = {
                 'conduct_id': conduct_id,
                 'strip_count': self.system_count,
-                'fukuan_1': fukuan_1,
-                'fukuan_2': fukuan_2,
-                'fukuan_3': fukuan_3,
-                'fukuan_4': fukuan_4,
-                'fukuan_list': [fukuan_1, fukuan_2, fukuan_3, fukuan_4][:self.system_count],
-                'strip_card_1': strip_cards[0],
-                'strip_card_2': strip_cards[1],
-                'strip_card_3': strip_cards[2],
-                'strip_card_4': strip_cards[3],
-                'strip_card_list': strip_cards[:self.system_count],
+                'fukuan_1': phys_fw[0],
+                'fukuan_2': phys_fw[1],
+                'fukuan_3': phys_fw[2],
+                'fukuan_4': phys_fw[3],
+                'fukuan_list': phys_fw[:self.system_count],
+                'strip_card_1': phys_card[0],
+                'strip_card_2': phys_card[1],
+                'strip_card_3': phys_card[2],
+                'strip_card_4': phys_card[3],
+                'strip_card_list': phys_card[:self.system_count],
                 'confirmed_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 'product_cls': product_cls
             }
@@ -2155,6 +2489,11 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                     lb.setPixmap(QPixmap())
                 except Exception:
                     pass
+        except Exception:
+            pass
+        try:
+            self._preview_image_path_up = [None] * self.MAX_STRIPS
+            self._preview_image_path_down = [None] * self.MAX_STRIPS
         except Exception:
             pass
 
@@ -2410,7 +2749,9 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         threads = []
         for i in range(self._visible_count()):
             detection_system_index = i + 1
-            fukuan_key = f"fukuan_{detection_system_index}"
+            n = _clamp_strip_count_ui(int(config0.get("strip_count", 3) or 3))
+            truth = _truth_strip_index_1based(detection_system_index, n)
+            fukuan_key = f"fukuan_{truth}"
             baseline_width = config0.get(fukuan_key, 0)
 
             if baseline_width > 0:
@@ -2626,7 +2967,9 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             self._load_system_count_from_config()
             for i in range(self._visible_count()):
                 detection_system_index = i + 1
-                fukuan_key = f"fukuan_{detection_system_index}"
+                n = _clamp_strip_count_ui(int(config0.get("strip_count", 3) or 3))
+                truth = _truth_strip_index_1based(detection_system_index, n)
+                fukuan_key = f"fukuan_{truth}"
                 baseline_width = config0.get(fukuan_key, 0)
 
                 # 初始化状态显示（详细面板由定时刷新统一绘制）
@@ -2819,7 +3162,9 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                 # --- 1. 配置读取和初始检查 ---
                 with open(os.path.join(_REPO_ROOT, 'config', 'config0.yaml'), 'r', encoding='utf-8') as file:
                     config0 = yaml.safe_load(file)
-                baseline_width = config0.get(f"fukuan_{detection_system_index}", 0)
+                n = _clamp_strip_count_ui(int(config0.get("strip_count", 3) or 3))
+                truth = _truth_strip_index_1based(detection_system_index, n)
+                baseline_width = config0.get(f"fukuan_{truth}", 0)
 
                 raw_data = self.total_data[system_index]
                 total_len = len(raw_data)
@@ -3737,10 +4082,13 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         try:
             if not folder_path or not file_name:
                 return
+            full_path = os.path.normpath(os.path.join(folder_path, file_name))
+            if 0 <= int(system_index) < len(self._preview_image_path_up):
+                self._preview_image_path_up[int(system_index)] = full_path
             realtime_labels = self._up_realtime_labels()
             label = realtime_labels[system_index]
             # 显示选中的图片
-            pixmap = QPixmap(os.path.join(folder_path, file_name))
+            pixmap = QPixmap(full_path)
 
             # 获取label的尺寸
             label_width = label.width()
@@ -3757,10 +4105,13 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         try:
             if not folder_path or not file_name:
                 return
+            full_path = os.path.normpath(os.path.join(folder_path, file_name))
+            if 0 <= int(system_index) < len(self._preview_image_path_down):
+                self._preview_image_path_down[int(system_index)] = full_path
             realtime_labels = self._down_realtime_labels()
             label = realtime_labels[system_index]
             # 显示选中的图片
-            pixmap = QPixmap(os.path.join(folder_path, file_name))
+            pixmap = QPixmap(full_path)
 
             # 获取label的尺寸
             label_width = label.width()
@@ -3796,12 +4147,14 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             if not os.access(full_path, os.R_OK):
                 print(f"文件不可读: {full_path}")
                 return
-            full_path = os.path.join(folder_path, file_name)
+            full_path = os.path.normpath(os.path.join(folder_path, file_name))
             print(f"点击加载路径: {full_path}")
             pixmap = QPixmap(full_path)
             if pixmap.isNull():
                 print(f"❌ QPixmap加载失败")
                 return
+            if 0 <= int(system_index) < len(self._preview_image_path_up):
+                self._preview_image_path_up[int(system_index)] = full_path
             click_labels = self._up_click_labels()
             label = click_labels[system_index]
 
@@ -3843,12 +4196,14 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             if not os.access(full_path, os.R_OK):
                 print(f"文件不可读: {full_path}")
                 return
-            full_path = os.path.join(folder_path, file_name)
+            full_path = os.path.normpath(os.path.join(folder_path, file_name))
             print(f"点击加载路径: {full_path}")
             pixmap = QPixmap(full_path)
             if pixmap.isNull():
                 print(f"❌ QPixmap加载失败")
                 return
+            if 0 <= int(system_index) < len(self._preview_image_path_down):
+                self._preview_image_path_down[int(system_index)] = full_path
             click_labels = self._down_click_labels()
             label = click_labels[system_index]
 
@@ -3871,4 +4226,6 @@ if __name__ == "__main__":
     _apply_app_theme(app)
     window = MainWindow()
     window.show()
-    sys.exit(app.exec_())
+    # PyQt5: exec_(); PySide6: exec()
+    _exec = getattr(app, "exec_", None) or getattr(app, "exec")
+    sys.exit(_exec())

@@ -13,17 +13,96 @@ from matplotlib import rcParams
 import matplotlib.font_manager as fm
 import pandas as pd
 import json
+import yaml
 import serial
 import os
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 from datetime import datetime, timedelta
 import torch.nn.functional as F
 import itertools
+import sys
 
 try:
     from scipy.ndimage import median_filter as scipy_median_filter
 except Exception:
     scipy_median_filter = None
+
+_PROJECT_ROOT = os.path.join(_REPO_ROOT)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+import strip_result_paths as _strip_paths
+
+
+def _is_probable_strip_subdir(dir_path: str) -> bool:
+    try:
+        if not os.path.isdir(dir_path):
+            return False
+        bn = os.path.basename(os.path.normpath(dir_path))
+        if bn in ("report", "split_vis", "__pycache__"):
+            return False
+        if bn.startswith("strip_"):
+            return True
+        # 新结构：卡号目录（以 fukuan.json / jsonl 作为强信号）
+        if os.path.exists(os.path.join(dir_path, "fukuan.json")):
+            return True
+        if os.path.exists(os.path.join(dir_path, "defect_events_center.jsonl")):
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def _list_strip_dirs_under_roll(roll_path: str):
+    """
+    在给定“卷目录”(detect result/日期/质保书号)下，枚举条带目录的绝对路径列表。
+    优先使用卷根 config0_snapshot.yaml 的 strip_dir_list + 相机目录；兼容旧结构（卷根直接 strip_*）。
+    """
+    roll_path = str(roll_path or "")
+    if not roll_path or not os.path.isdir(roll_path):
+        return []
+
+    cfg0 = _strip_paths.read_result_roll_config0(roll_path)
+    names = cfg0.get("strip_dir_list") if isinstance(cfg0, dict) else None
+    if not (isinstance(names, list) and names and all(str(x).strip() for x in names)):
+        legacy = [
+            os.path.join(roll_path, d)
+            for d in os.listdir(roll_path)
+            if d.startswith("strip_") and os.path.isdir(os.path.join(roll_path, d))
+        ]
+        legacy.sort(key=lambda p: os.path.basename(p))
+        return legacy
+
+    cam_candidates = []
+    try:
+        with open(os.path.join(_PROJECT_ROOT, "config", "config.yaml"), "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        up = cfg.get("camrea_id_up", []) or []
+        down = cfg.get("camrea_id_down", []) or []
+        for x in list(up) + list(down):
+            s = str(x).strip()
+            if s and s not in cam_candidates:
+                cam_candidates.append(s)
+    except Exception:
+        cam_candidates = []
+
+    if not cam_candidates:
+        cam_candidates = ["上表面", "下表面", "2", "3"]
+
+    out = []
+    for bn in names:
+        bn = str(bn).strip()
+        if not bn:
+            continue
+        placed = False
+        for cam in cam_candidates:
+            p = os.path.join(roll_path, cam, bn)
+            if os.path.isdir(p):
+                out.append(p)
+                placed = True
+                break
+        if not placed:
+            out.append(os.path.join(roll_path, cam_candidates[0], bn))
+    return out
 
 
 def area_val_matches_print_area_filter(area_val: float, area_range) -> bool:
@@ -1851,8 +1930,8 @@ class Anomaly_info_List:
         fp = os.path.normpath(self.filepath)
         basename = os.path.basename(fp)
 
-        # 如果 filepath 本身就是 strip_x（或以 strip_ 开头），把它当作单条带钢目录处理
-        if basename.startswith("strip_"):
+        # 如果 filepath 本身就是条带目录（strip_* 或卡号目录），把它当作单条带钢目录处理
+        if _is_probable_strip_subdir(fp):
             candidates = [
                 os.path.join(fp, str(id), listname),
                 os.path.join(fp, str(id), f"{listname}.json"),
@@ -1865,11 +1944,12 @@ class Anomaly_info_List:
                 return fallback if fallback is not None else []
             return loaded
 
-        # 否则把 filepath 当作 CAM 目录，遍历其下的 strip_ 子文件夹
+        # 否则把 filepath 当作 CAM 目录，遍历其下的条带子目录
         try:
             subfolders = [
-                d for d in os.listdir(fp)
-                if d.startswith("strip_") and os.path.isdir(os.path.join(fp, d))
+                d
+                for d in os.listdir(fp)
+                if _is_probable_strip_subdir(os.path.join(fp, d))
             ]
         except Exception as e:
             print(f"[ERROR] 列出目录 {fp} 失败: {e}")
@@ -1953,16 +2033,12 @@ def find_folders_with_id(base_path, product_id, multi_strip=False):
         print(f"找到当天的文件夹: {today_folder_path}")
 
         if multi_strip:
-            subfolders = [
-                os.path.join(today_folder_path, f)
-                for f in os.listdir(today_folder_path)
-                if f.startswith("strip_") and os.path.isdir(os.path.join(today_folder_path, f))
-            ]
+            subfolders = _list_strip_dirs_under_roll(today_folder_path)
             if subfolders:
                 print(f"检测到多条钢带: {subfolders}")
                 return subfolders
             else:
-                print(f"[提示] {today_folder_path} 下未发现 strip_ 子目录，返回主路径。")
+                print(f"[提示] {today_folder_path} 下未发现条带子目录，返回主路径。")
         folder_path.append(today_folder_path)
         print(folder_path)
         return folder_path
@@ -1972,16 +2048,12 @@ def find_folders_with_id(base_path, product_id, multi_strip=False):
         print(f"找到前一天的文件夹: {yesterday_folder_path}")
 
         if multi_strip:
-            subfolders = [
-                os.path.join(yesterday_folder_path, f)
-                for f in os.listdir(yesterday_folder_path)
-                if f.startswith("strip_") and os.path.isdir(os.path.join(yesterday_folder_path, f))
-            ]
+            subfolders = _list_strip_dirs_under_roll(yesterday_folder_path)
             if subfolders:
                 print(f"检测到前一天的多条钢带: {subfolders}")
                 return subfolders
             else:
-                print(f"[提示] {yesterday_folder_path} 下未发现 strip_ 子目录，返回主路径。")
+                print(f"[提示] {yesterday_folder_path} 下未发现条带子目录，返回主路径。")
         folder_path.append(yesterday_folder_path)
         print(folder_path)
         return folder_path
@@ -1990,16 +2062,12 @@ def find_folders_with_id(base_path, product_id, multi_strip=False):
         print(f"找测试文件夹: {test_folder_path}")
 
         if multi_strip:
-            subfolders = [
-                os.path.join(test_folder_path, f)
-                for f in os.listdir(test_folder_path)
-                if f.startswith("strip_") and os.path.isdir(os.path.join(test_folder_path, f))
-            ]
+            subfolders = _list_strip_dirs_under_roll(test_folder_path)
             if subfolders:
                 print(f"检测到多条钢带: {subfolders}")
                 return subfolders
             else:
-                print(f"[提示] {test_folder_path} 下未发现 strip_ 子目录，返回主路径。")
+                print(f"[提示] {test_folder_path} 下未发现条带子目录，返回主路径。")
         folder_path.append(test_folder_path)
         return folder_path
 

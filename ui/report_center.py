@@ -4,7 +4,7 @@ import os
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 import re
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import yaml
 from PyQt5 import QtCore, QtGui, QtWidgets
@@ -23,7 +23,6 @@ from PyQt5.QtWidgets import (
 
 from PyQt5.QtWidgets import QInputDialog, QLineEdit
 from report_change import ReportWindow
-import sys
 from cls_config import ClsConfigWindow
 from cls_model_registry import compat_and_remap as _cls_compat_and_remap, rptcfg_class_names as _rptcfg_class_names
 
@@ -31,6 +30,12 @@ from cls_model_registry import compat_and_remap as _cls_compat_and_remap, rptcfg
 _PROJECT_ROOT = os.path.join(_REPO_ROOT)
 _AUTH_CONFIG_PATH = os.path.join(_PROJECT_ROOT, "config", "auth.yaml")
 _DETECT_ROOT = os.path.join(_PROJECT_ROOT, "detect result")
+
+import sys
+
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+import strip_result_paths as _strip_paths
 
 
 def _read_auth_password(role: str) -> str:
@@ -74,14 +79,22 @@ class ResultSelection:
     date: str
     conduct_id: str
     strip_id_1based: int
+    strip_dir_basename: Optional[str] = None
 
     @property
     def result_all_path(self) -> str:
         return os.path.join(_DETECT_ROOT, self.date, self.conduct_id)
 
     @property
+    def strip_report_basename(self) -> str:
+        # 新数据：与检测结果目录同名；旧数据：回退 strip_N
+        if self.strip_dir_basename:
+            return str(self.strip_dir_basename)
+        return f"strip_{self.strip_id_1based}"
+
+    @property
     def report_strip_dir(self) -> str:
-        return os.path.join(self.result_all_path, "report", f"strip_{self.strip_id_1based}")
+        return os.path.join(self.result_all_path, "report", self.strip_report_basename)
 
 
 class ReportCenterWindow(QtWidgets.QMainWindow):
@@ -238,8 +251,13 @@ class ReportCenterWindow(QtWidgets.QMainWindow):
         self.comboConductId.addItems(ids)
         self._on_conduct_changed()
 
-    def _infer_strip_ids(self, sel: ResultSelection) -> List[int]:
-        # Prefer scanning strip_ dirs under first up camera dir
+    def _infer_strip_entries(self, sel: ResultSelection) -> List[Tuple[int, str]]:
+        """
+        返回 (strip_id_1based, strip_dir_basename) 列表。
+        - strip_id_1based 仍保持 1..N 的编号（用于生成脚本参数与 rptcfg.strip_id）
+        - strip_dir_basename 为 detect result 内实际目录名（可能为卡号目录）
+        """
+        first_cam = None
         try:
             with open(os.path.join(_PROJECT_ROOT, "config", "config.yaml"), "r", encoding="utf-8") as f:
                 cfg = yaml.safe_load(f) or {}
@@ -248,28 +266,30 @@ class ReportCenterWindow(QtWidgets.QMainWindow):
         except Exception:
             first_cam = None
 
-        if first_cam:
-            cam_dir = os.path.join(sel.result_all_path, first_cam)
-            strips = []
-            for d in _safe_listdir(cam_dir):
-                if d.startswith("strip_") and os.path.isdir(os.path.join(cam_dir, d)):
-                    try:
-                        strips.append(int(d.split("_", 1)[1]))
-                    except Exception:
-                        continue
-            strips = sorted(set(strips))
-            if strips:
-                return strips
+        roll = sel.result_all_path
+        cfg0_roll = _strip_paths.read_result_roll_config0(roll)
+        n = int(cfg0_roll.get("strip_count", 0) or 0) if isinstance(cfg0_roll, dict) else 0
+        if n <= 0:
+            try:
+                with open(_CONFIG0_PATH, "r", encoding="utf-8") as f:
+                    cfg0_live = yaml.safe_load(f) or {}
+                n = int(cfg0_live.get("strip_count", 3) or 3)
+            except Exception:
+                n = 3
+        n = max(1, min(8, int(n)))
 
-        # Fallback to config0.strip_count
-        try:
-            with open(_CONFIG0_PATH, "r", encoding="utf-8") as f:
-                cfg0 = yaml.safe_load(f) or {}
-            n = int(cfg0.get("strip_count", 3))
-            n = max(1, min(8, n))
-            return list(range(1, n + 1))
-        except Exception:
-            return [1, 2, 3]
+        names = _strip_paths.strip_dir_list_from_roll(roll, int(n))
+        if isinstance(names, list) and len(names) == int(n) and all(str(x).strip() for x in names):
+            return [(i + 1, str(names[i])) for i in range(int(n))]
+
+        if first_cam:
+            cam_dir = os.path.join(roll, first_cam)
+            bases = _strip_paths.discover_strip_dir_basenames_under_cam(cam_dir)
+            if bases:
+                return [(i + 1, str(bases[i])) for i in range(len(bases))]
+
+        # 最后兜底：只有编号（目录可能尚未生成）
+        return [(i, f"strip_{i}") for i in range(1, int(n) + 1)]
 
     def _on_conduct_changed(self) -> None:
         date = self.comboDate.currentText().strip()
@@ -279,8 +299,8 @@ class ReportCenterWindow(QtWidgets.QMainWindow):
             return
         # initial selection: strip 1; later refreshed by inference
         tmp_sel = ResultSelection(date=date, conduct_id=cid, strip_id_1based=1)
-        strip_ids = self._infer_strip_ids(tmp_sel)
-        # 优先读取该卷根目录 config0_snapshot.yaml；其次读 report/strip_N/config0_snapshot.yaml；最后回退编号
+        strip_entries = self._infer_strip_entries(tmp_sel)
+        # 优先读取该卷根目录 config0_snapshot.yaml；其次读 report/<条带目录>/config0_snapshot.yaml；最后回退编号
         strip_card_map = {}
         try:
             root_snap = os.path.join(tmp_sel.result_all_path, "config0_snapshot.yaml")
@@ -289,7 +309,7 @@ class ReportCenterWindow(QtWidgets.QMainWindow):
                 with open(root_snap, "r", encoding="utf-8") as f:
                     cfg0_root = yaml.safe_load(f) or {}
 
-            for sid in strip_ids:
+            for sid, folder in strip_entries:
                 val = ""
                 if isinstance(cfg0_root, dict):
                     cards = cfg0_root.get("strip_card_list") or []
@@ -299,7 +319,7 @@ class ReportCenterWindow(QtWidgets.QMainWindow):
                         val = str(cfg0_root.get(f"strip_card_{sid}", "") or "").strip()
 
                 if not val:
-                    snap = os.path.join(tmp_sel.result_all_path, "report", f"strip_{sid}", "config0_snapshot.yaml")
+                    snap = os.path.join(tmp_sel.result_all_path, "report", str(folder), "config0_snapshot.yaml")
                     if os.path.exists(snap):
                         with open(snap, "r", encoding="utf-8") as f:
                             cfg0 = yaml.safe_load(f) or {}
@@ -314,13 +334,17 @@ class ReportCenterWindow(QtWidgets.QMainWindow):
         except Exception:
             strip_card_map = {}
 
-        for sid in strip_ids:
+        for sid, folder in strip_entries:
             card = strip_card_map.get(int(sid))
             # 甲方口径：优先直接显示工人输入的“带钢卡号”；内部 data 仍保存 strip_id 数字
-            label = str(card) if card else str(sid)
+            label = str(card) if card else str(folder)
             self.comboStripId.addItem(label, int(sid))
             try:
-                tip = f"带钢号：{sid}" if card else f"带钢号：{sid}"
+                self.comboStripId.setItemData(self.comboStripId.count() - 1, str(folder), QtCore.Qt.UserRole + 1)
+            except Exception:
+                pass
+            try:
+                tip = f"带钢序号：{sid}；目录：{folder}" + (f"；卡号：{card}" if card else "")
                 self.comboStripId.setItemData(self.comboStripId.count() - 1, tip, QtCore.Qt.ToolTipRole)
             except Exception:
                 pass
@@ -346,7 +370,16 @@ class ReportCenterWindow(QtWidgets.QMainWindow):
             QMessageBox.warning(self, "带钢号错误", f"带钢号必须为>=1整数，当前：{strip_s}")
             return None
 
-        sel = ResultSelection(date=date, conduct_id=cid, strip_id_1based=strip_id)
+        folder = None
+        try:
+            folder = self.comboStripId.currentData(QtCore.Qt.UserRole + 1)
+        except Exception:
+            folder = None
+        folder_s = str(folder).strip() if folder is not None else ""
+        if not folder_s:
+            folder_s = _strip_paths.resolve_strip_dir_basename(os.path.join(_DETECT_ROOT, date, cid), int(strip_id))
+
+        sel = ResultSelection(date=date, conduct_id=cid, strip_id_1based=strip_id, strip_dir_basename=folder_s)
         if not os.path.isdir(sel.result_all_path):
             QMessageBox.warning(self, "目录不存在", f"检测结果目录不存在：\n{sel.result_all_path}")
             return None

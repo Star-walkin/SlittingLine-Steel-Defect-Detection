@@ -1,6 +1,7 @@
 import time
 import os
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+import sys
 import yaml
 from cls_model import ProjectionNet
 import torch
@@ -16,6 +17,11 @@ import matplotlib.pyplot as plt
 from collections import defaultdict
 import warnings
 import json
+
+_PROJECT_ROOT = os.path.join(_REPO_ROOT)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+import strip_result_paths as _strip_paths
 
 class ImageDataset(Dataset):
     """ dataset name."""
@@ -65,8 +71,8 @@ def cls_anomalies(model_path, result_all_path, camrea_id, multi_strip=False):
         return
 
     # 若存在 strip_1 等文件夹，自动启用多带钢模式
-    strip_paths = [os.path.join(cam_dir, d) for d in os.listdir(cam_dir)
-                   if d.startswith("strip_") and os.path.isdir(os.path.join(cam_dir, d))]
+    bases = _strip_paths.discover_strip_dir_basenames_under_cam(cam_dir)
+    strip_paths = [os.path.join(cam_dir, d) for d in bases]
     if len(strip_paths) > 0:
         multi_strip = True
 

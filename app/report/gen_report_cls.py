@@ -15,6 +15,9 @@ import matplotlib
 
 _DETECT_ROOT_DEFAULT = os.path.join(_REPO_ROOT, "detect result")
 _PROJECT_ROOT = os.path.join(_REPO_ROOT)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+import strip_result_paths as _strip_paths
 
 
 def _stable_color_for_text(text: str) -> str:
@@ -276,8 +279,9 @@ def gen_detect_report(test_path,fukuan0,conduct_id,anomaly_area_cls_range,remove
     report_root = os.path.join(result_all_path, "report")
     os.makedirs(report_root, exist_ok=True)
 
-    # 针对当前条带，再建一个独立子目录，例如 strip_0001
-    strip_dir = os.path.join(str(report_root), f"strip_{strip_id+1}")
+    strip_folder_basename = _strip_paths.resolve_strip_dir_basename(result_all_path, int(strip_id) + 1)
+    # 针对当前条带，再建一个独立子目录（与检测结果条带目录同名，便于归档/检索）
+    strip_dir = os.path.join(str(report_root), strip_folder_basename)
     os.makedirs(strip_dir, exist_ok=True)
 
     # 以后所有保存路径，都从 strip_dir 开始
@@ -309,7 +313,7 @@ def gen_detect_report(test_path,fukuan0,conduct_id,anomaly_area_cls_range,remove
             return default
 
     # ====== 1) 读取幅宽（从标定相机的 strip 目录里读）======
-    calib_strip_dir = os.path.join(result_all_path, str(calibrat_cam_id), f"strip_{strip_id + 1}")
+    calib_strip_dir = os.path.join(result_all_path, str(calibrat_cam_id), strip_folder_basename)
     fukuan_path = os.path.join(calib_strip_dir, "fukuan.json")
     fukuan_list = load_json_safe(fukuan_path, [])
     if len(fukuan_list) == 0:
@@ -351,7 +355,7 @@ def gen_detect_report(test_path,fukuan0,conduct_id,anomaly_area_cls_range,remove
     # ====== 2) 读取上表面各相机分类结果 ======
     up_anomaly_info_all = []
     for cam_id in camrea_id_up_report:
-        cam_strip_dir = os.path.join(result_all_path, str(cam_id), f"strip_{strip_id + 1}")
+        cam_strip_dir = os.path.join(result_all_path, str(cam_id), strip_folder_basename)
         p = os.path.join(cam_strip_dir, "anomaly_info_result.json")
         data = load_json_safe(p, [])
         up_anomaly_info_all.append(data)
@@ -359,7 +363,7 @@ def gen_detect_report(test_path,fukuan0,conduct_id,anomaly_area_cls_range,remove
     # ====== 3) 读取下表面各相机分类结果 ======
     down_anomaly_info_all = []
     for cam_id in camrea_id_down_report:
-        cam_strip_dir = os.path.join(result_all_path, str(cam_id), f"strip_{strip_id + 1}")
+        cam_strip_dir = os.path.join(result_all_path, str(cam_id), strip_folder_basename)
         p = os.path.join(cam_strip_dir, "anomaly_info_result.json")
         data = load_json_safe(p, [])
         down_anomaly_info_all.append(data)
@@ -443,7 +447,7 @@ def gen_all_reports(result_all_path, fukuan0, conduct_id, anomaly_area_cls_range
     strip_only_0based: 仅生成该索引对应条带（0 起）；None 表示全部。
     """
     if not camrea_id_up_list:
-        print("[ERROR] camrea_id_up_list 为空，无法定位 strip_ 目录。", file=sys.stderr)
+        print("[ERROR] camrea_id_up_list 为空，无法定位条带目录。", file=sys.stderr)
         sys.exit(1)
 
     first_cam = str(camrea_id_up_list[0])
@@ -452,14 +456,8 @@ def gen_all_reports(result_all_path, fukuan0, conduct_id, anomaly_area_cls_range
         print(f"[ERROR] 相机目录不存在：{cam_dir}", file=sys.stderr)
         sys.exit(1)
 
-    strip_paths = sorted(
-        [
-            os.path.join(cam_dir, d)
-            for d in os.listdir(cam_dir)
-            if d.startswith("strip_") and os.path.isdir(os.path.join(cam_dir, d))
-        ],
-        key=lambda p: os.path.basename(p),
-    )
+    bases = _strip_paths.discover_strip_dir_basenames_under_cam(cam_dir)
+    strip_paths = [os.path.join(cam_dir, b) for b in bases]
 
     if len(strip_paths) == 0:
         # 单条带钢，维持原逻辑
@@ -472,6 +470,7 @@ def gen_all_reports(result_all_path, fukuan0, conduct_id, anomaly_area_cls_range
             print_cls, class_list, update_info, standard_area_tables,
             colors, class_labels, area_range, 0, result_all_path, fukuan_ratio,
             rptcfg_raw_snapshot=rptcfg_raw_snapshot, config_snapshot=config_snapshot,
+            config0_snapshot=config0_snapshot,
         )
         print("报告生成完成。")
         return

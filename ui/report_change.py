@@ -173,6 +173,10 @@ _PROJECT_ROOT = os.path.join(_REPO_ROOT)
 _DETAIL_OPT_JSON = os.path.join(_PROJECT_ROOT, "config", "detail_optimization.json")
 _AUTH_CONFIG_PATH = os.path.join(_PROJECT_ROOT, "config", "auth.yaml")
 
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+import strip_result_paths as _strip_paths
+
 
 def _read_auth_password(role: str) -> str:
     try:
@@ -588,7 +592,8 @@ class ReportWindow(QMainWindow, Ui_Report):
                         card = str(cfg0.get(f"strip_card_{strip_n}", "") or "").strip()
 
                 if not card:
-                    snap = os.path.join(root, "report", f"strip_{strip_n}", "config0_snapshot.yaml")
+                    folder = _strip_paths.resolve_strip_dir_basename(root, int(strip_n))
+                    snap = os.path.join(root, "report", folder, "config0_snapshot.yaml")
                     if os.path.exists(snap):
                         with open(snap, "r", encoding="utf-8") as f:
                             cfg0 = yaml.safe_load(f) or {}
@@ -1056,8 +1061,8 @@ class ReportWindow(QMainWindow, Ui_Report):
             strip_n = max(1, int(float(strip_n_s)))
         except Exception:
             strip_n = 1
-        strip_folder = f"strip_{strip_n}"
         result_root = os.path.join(_DETECT_RESULT_DIR, date_s, cid)
+        strip_folder = _strip_paths.resolve_strip_dir_basename(result_root, int(strip_n))
         use_json = False
 
         cfg_path = os.path.join(_PROJECT_ROOT, "config", "config.yaml")
@@ -1339,14 +1344,23 @@ class ReportWindow(QMainWindow, Ui_Report):
         :param strip_id:   钢带号（1 基准，字符串或整数均可）
         :return:           [path] 若存在，否则 []
         """
-        strip_dir_name = f"strip_{strip_id}"
-        target = os.path.join(base_path, date_str, product_id, "report", strip_dir_name)
+        try:
+            strip_n = max(1, int(float(str(strip_id))))
+        except Exception:
+            strip_n = 1
 
-        if os.path.exists(target):
-            print(f"找到报告目录: {target}")
-            return [target]
+        roll = os.path.join(base_path, date_str, product_id)
+        primary = _strip_paths.resolve_strip_dir_basename(roll, int(strip_n))
+        candidates = [
+            os.path.join(roll, "report", primary),
+            os.path.join(roll, "report", f"strip_{strip_n}"),
+        ]
+        for target in candidates:
+            if os.path.exists(target):
+                print(f"找到报告目录: {target}")
+                return [target]
 
-        print(f"报告目录不存在: {target}")
+        print(f"报告目录不存在: 依次尝试 {candidates}")
         return []
 
     def initUI3(self):

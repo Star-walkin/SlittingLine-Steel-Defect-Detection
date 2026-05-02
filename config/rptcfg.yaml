@@ -1,11 +1,9 @@
 area_range: []
 check_cls: '1'
 class_labels:
-  1: 破洞
-  2: 擦伤
-  3: 污渍
-  4: 划伤
-  5: 拉伤起皮
+  1: 拉伤凹点
+  2: 白斑
+  3: 辊印
 class_labels_by_product:
   '1':
     1: 破洞
@@ -120,16 +118,14 @@ print_cls:
 - 1
 - 2
 - 3
-- 4
-- 5
 product_cls: '1'
 product_cls_names:
   '1': 316L
   '2': '301'
   '3': '321'
   '4': '304'
-rptcfg_revision: 294
-rptcfg_updated_at: '2026-04-27 23:57:31'
+rptcfg_revision: 304
+rptcfg_updated_at: '2026-05-02 14:13:01'
 rptcfg_updated_by: DESKTOP-NSH13CD
 steel_length_range: []
 strip_id: '1'

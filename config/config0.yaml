@@ -1,5 +1,5 @@
-conduct_id: '052'
-confirmed_at: '2026-04-27 23:57:31'
+conduct_id: '02'
+confirmed_at: '2026-05-02 14:13:01'
 fukuan_1: 500.0
 fukuan_2: 500.0
 fukuan_3: 500.0
@@ -9,12 +9,12 @@ fukuan_list:
 - 500.0
 - 500.0
 product_cls: '1'
-strip_card_1: '01'
-strip_card_2: '01'
-strip_card_3: '01'
+strip_card_1: C
+strip_card_2: B
+strip_card_3: A
 strip_card_4: ''
 strip_card_list:
-- '01'
-- '01'
-- '01'
+- C
+- B
+- A
 strip_count: 3

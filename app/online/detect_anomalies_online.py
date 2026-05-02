@@ -4,38 +4,39 @@ import queue
 import threading
 import time
 import os
-_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 import json
 import yaml
 import socket
 import struct
 import cv2
 import glob
-from function_bank import test_one_image, get_one_image_list, Consecutive_anomaly_Checker, Anomaly_info_List, \
-    find_folders_with_id, fix_json, split_multi_strips, dummy_context, dummy_lock, crop_square_from_image_u8, DEFECT_PATCH_SIDE
-from seg_model_train.seg_model_NEW import UNet
+from app.common.function_bank import (
+    get_one_image_list,
+    Consecutive_anomaly_Checker,
+    Anomaly_info_List,
+    find_folders_with_id,
+    fix_json,
+    split_multi_strips,
+    dummy_context,
+    dummy_lock,
+    crop_square_from_image_u8,
+    DEFECT_PATCH_SIDE,
+)
 import torch
 from datetime import datetime
 import traceback
-import speed_monitor
-from speed_monitor import init_monitor, get_monitor, StageTimer
+from app.common import speed_monitor
+from app.common.speed_monitor import init_monitor, get_monitor, StageTimer
 import shutil
 
-# 若使用 det_model（SimpleAD + 滑动窗口）
-try:
-    from det_model.model import build_model as build_simplead
-    from det_model.infer import SlidingWindowDetector
-    DET_MODEL_AVAILABLE = True
-except ImportError:
-    build_simplead = None
-    SlidingWindowDetector = None
-    DET_MODEL_AVAILABLE = False
+import strip_result_paths as _strip_paths
 
 # PatchCore / 局部对比度（与 detectoutline02 一致）
 try:
-    from patchcore_model.online_detector import PatchCoreDetector, InferEngine
-    from patchcore_model.gradient_defect import detect_defects_by_gradient
-    from patchcore_model.local_contrast_defect import detect_defects_by_local_contrast
+    from models.patchcore_model.online_detector import PatchCoreDetector, InferEngine
+    from models.patchcore_model.gradient_defect import detect_defects_by_gradient
+    from models.patchcore_model.local_contrast_defect import detect_defects_by_local_contrast
     PATCHCORE_AVAILABLE = True
 except ImportError:
     PatchCoreDetector = None
@@ -582,12 +583,13 @@ def _process_batch(batch):
 
 def init_detect(conduct_id, result_path_all, Consecutive_thres_num, cam_index):
     """
-    与 detectoutline02.init_detect 对齐：PatchCore → SimpleAD(det_model) → UNet。
-    结果目录与线下一致：result_path_all / {cam_index+1} / strip_*
+    PatchCore 在线检测初始化（便携仓库仅保留 PatchCore，不含其它模型回退）。
+    结果目录与线下一致：result_path_all / <相机输出目录> / <带钢目录>
     """
     with open(os.path.join(_REPO_ROOT, 'config', 'config0.yaml'), 'r', encoding='utf-8') as f:
         config0 = yaml.safe_load(f)
     _, fukuan0 = get_strip_count_and_fukuan(config0)
+    strip_dir_names = _strip_paths.build_strip_dir_names(config0, len(fukuan0))
 
     with open(os.path.join(_REPO_ROOT, 'config', 'config.yaml'), 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
@@ -614,11 +616,6 @@ def init_detect(conduct_id, result_path_all, Consecutive_thres_num, cam_index):
     _save_img_max_per_frame = int(config.get("save_defect_images_max_per_frame", 12) or 12)
     _save_img_max_per_min = int(config.get("save_defect_images_max_per_minute", 240) or 240)
     _save_img_keep_last = int(config.get("save_defect_images_keep_last_n", 2000) or 2000)
-    model_name_det = config.get(f"cam{cam_index + 1}_model_name_det")
-    model_name_unet = config.get(f"cam{cam_index + 1}_model_name")
-    _norm = lambda p: (p or "").replace("\\", "/")
-    if not model_name_det and model_name_unet and "det_model" in _norm(model_name_unet) and "train-result" in _norm(model_name_unet):
-        model_name_det = model_name_unet
     cut_ratio = config[f"cam{cam_index + 1}_cut_ratio"]
     img_size = config[f"cam{cam_index + 1}_img_size"]
     cam_y_times = config[f"cam{cam_index + 1}_times"]
@@ -635,7 +632,7 @@ def init_detect(conduct_id, result_path_all, Consecutive_thres_num, cam_index):
         json.dump({"last_id": 0}, open(history_id_path, "w", encoding="utf-8"), indent=4)
 
     for i in range(len(fukuan0)):
-        strip_dir = os.path.join(result_path, f"strip_{i + 1}")
+        strip_dir = os.path.join(result_path, strip_dir_names[i])
         os.makedirs(strip_dir, exist_ok=True)
         os.makedirs(os.path.join(strip_dir, "defect_images"), exist_ok=True)
         for name in [
@@ -650,49 +647,51 @@ def init_detect(conduct_id, result_path_all, Consecutive_thres_num, cam_index):
             if not os.path.exists(fpath):
                 json.dump([], open(fpath, "w", encoding="utf-8"), ensure_ascii=False, indent=4)
 
-    M = None
     in_channels_detected = 1
     standard_ratio_y = standard_ratio_x * cam_y_times
 
-    if PATCHCORE_AVAILABLE:
-        try:
-            root_dir = os.path.dirname(os.path.abspath(__file__))
-            _weights_root_name = config.get("patchcore_weights_root", "weights")
-            patchcore_root = os.path.join(
-                root_dir, "patchcore_model", _weights_root_name, "image_data_patchcore_0228"
-            )
-            cam_name = f"CAM{cam_index + 1}"
-            memory_path = os.path.join(patchcore_root, cam_name, "patchcore_memory.npz")
-            if os.path.isfile(memory_path):
-                print(f"[CAM{cam_index + 1}] 使用 PatchCoreDetector: {memory_path}")
-                _device = _get_safe_device()
-                M = PatchCoreDetector(
-                    memory_path=memory_path,
-                    conduct_id=conduct_id,
-                    fukuan0=fukuan0,
-                    cut_ratio=cut_ratio,
-                    img_size=img_size,
-                    seg_anomaly_thres=seg_anomaly_thres,
-                    standard_ratio_x=standard_ratio_x,
-                    standard_ratio_y=standard_ratio_y,
-                    steel_real_y0=steel_real_y0,
-                    device=_device,
-                    patchcore_k=patchcore_k,
-                    use_gradient_detection=use_gradient_detection,
-                    grad_threshold=grad_threshold,
-                    blur_ksize=blur_ksize,
-                    edge_crop=edge_crop,
-                    bg_ksize=bg_ksize,
-                    diff_threshold=diff_threshold,
-                    patchcore_edge_soft_border=patchcore_edge_soft_border,
-                    patchcore_edge_strength=patchcore_edge_strength,
-                    patchcore_edge_weight_profile=patchcore_edge_weight_profile,
-                )
-            else:
-                print(f"[CAM{cam_index + 1}] 未找到 PatchCore 权重 {memory_path}，将尝试 det_model / UNet。")
-        except Exception as e:
-            print(f"[CAM{cam_index + 1}] PatchCoreDetector 初始化失败，将回退: {e}")
-            M = None
+    if not PATCHCORE_AVAILABLE:
+        raise RuntimeError(f"[CAM{cam_index + 1}] PatchCore 模块不可用，无法启动检测。")
+
+    _weights_root_name = config.get("patchcore_weights_root", "weights")
+    patchcore_root = os.path.join(
+        _REPO_ROOT, "models", "patchcore_model", _weights_root_name, "image_data_patchcore_0228"
+    )
+    cam_name = f"CAM{cam_index + 1}"
+    memory_path = os.path.join(patchcore_root, cam_name, "patchcore_memory.npz")
+    if not os.path.isfile(memory_path):
+        raise FileNotFoundError(
+            f"[CAM{cam_index + 1}] 未找到 PatchCore 权重文件：{memory_path}\n"
+            f"请检查：models/patchcore_model/{_weights_root_name}/image_data_patchcore_0228/{cam_name}/patchcore_memory.npz"
+        )
+    _device = _get_safe_device()
+    print(f"[CAM{cam_index + 1}] 使用 PatchCoreDetector: {memory_path}")
+    print(f"[CAM{cam_index + 1}] 使用设备: {_device}")
+    try:
+        M = PatchCoreDetector(
+            memory_path=memory_path,
+            conduct_id=conduct_id,
+            fukuan0=fukuan0,
+            cut_ratio=cut_ratio,
+            img_size=img_size,
+            seg_anomaly_thres=seg_anomaly_thres,
+            standard_ratio_x=standard_ratio_x,
+            standard_ratio_y=standard_ratio_y,
+            steel_real_y0=steel_real_y0,
+            device=_device,
+            patchcore_k=patchcore_k,
+            use_gradient_detection=use_gradient_detection,
+            grad_threshold=grad_threshold,
+            blur_ksize=blur_ksize,
+            edge_crop=edge_crop,
+            bg_ksize=bg_ksize,
+            diff_threshold=diff_threshold,
+            patchcore_edge_soft_border=patchcore_edge_soft_border,
+            patchcore_edge_strength=patchcore_edge_strength,
+            patchcore_edge_weight_profile=patchcore_edge_weight_profile,
+        )
+    except Exception as e:
+        raise RuntimeError(f"[CAM{cam_index + 1}] PatchCoreDetector 初始化失败: {e}") from e
 
     # 将 defect_images 写盘限流参数注入到 locator（PatchCoreDetector 内部使用 test_one_image 作为 locator）
     try:
@@ -706,121 +705,35 @@ def init_detect(conduct_id, result_path_all, Consecutive_thres_num, cam_index):
     except Exception:
         pass
 
-    def _resolve_det_ckpt(path: str):
-        if not path:
-            return None
-        if os.path.isfile(path):
-            return path
-        try:
-            base_dir = os.path.dirname(path)
-            if not os.path.isdir(base_dir):
-                return None
-            lp = os.path.join(base_dir, "last.pth")
-            if os.path.isfile(lp):
-                return lp
-            best = None
-            for fn in os.listdir(base_dir):
-                if not (fn.startswith("epoch_") and fn.endswith(".pth")):
-                    continue
-                try:
-                    ep = int(fn.split("_", 1)[1].split(".", 1)[0])
-                except Exception:
-                    continue
-                if best is None or ep > best[0]:
-                    best = (ep, fn)
-            if best is not None:
-                return os.path.join(base_dir, best[1])
-        except Exception:
-            pass
-        return None
-
-    det_ckpt_path = _resolve_det_ckpt(model_name_det)
-    _device = _get_safe_device()
-    print(f"[CAM{cam_index + 1}] 使用设备: {_device}")
-
-    tried_simplead = False
-    if M is None and DET_MODEL_AVAILABLE and det_ckpt_path and os.path.isfile(det_ckpt_path):
-        tried_simplead = True
-        try:
-            print(f"[CAM{cam_index + 1}] Loading SimpleAD: {det_ckpt_path}")
-            state_dict = torch.load(det_ckpt_path, map_location=_device)
-            model = build_simplead(base_ch=32).to(_device)
-            model.load_state_dict(state_dict)
-            model.eval()
-            M = SlidingWindowDetector(
-                model=model, conduct_id=conduct_id, fukuan0=fukuan0, cut_ratio=cut_ratio,
-                img_size=img_size, seg_anomaly_thres=seg_anomaly_thres,
-                standard_ratio_x=standard_ratio_x, standard_ratio_y=standard_ratio_y, steel_real_y0=steel_real_y0,
-                flatten_bg=True, patch_stride=128
-            )
-        except Exception as e:
-            print(f"[CAM{cam_index + 1}] SimpleAD 加载失败，回退 UNet: {e}")
-            M = None
-
-    if M is None:
-        candidates = []
-        if model_name_unet and os.path.isfile(model_name_unet):
-            if not (tried_simplead and det_ckpt_path and os.path.normpath(model_name_unet) == os.path.normpath(det_ckpt_path)):
-                candidates.append(model_name_unet)
-        if model_name_det and os.path.isfile(model_name_det):
-            try:
-                sd = torch.load(model_name_det, map_location="cpu")
-                if isinstance(sd, dict) and (
-                    ("enc1.0.weight" in sd) or any(k.startswith("down1.conv1.") for k in sd.keys())
-                ):
-                    candidates.append(model_name_det)
-            except Exception:
-                pass
-        if not candidates:
-            raise FileNotFoundError(
-                f"UNet checkpoint not found for CAM{cam_index + 1}: model_name={model_name_unet}, det={model_name_det}"
-            )
-
-        model_path = candidates[0]
-        print(f"[CAM{cam_index + 1}] Loading UNet: {model_path}")
-        checkpoint = torch.load(model_path, map_location=_device)
-        state_dict = checkpoint if isinstance(checkpoint, dict) else checkpoint.state_dict()
-        first_key = list(state_dict.keys())[0]
-        in_channels_detected = 1
-        if "weight" in first_key:
-            in_channels_detected = state_dict[first_key].shape[1]
-        out_channels_detected = 1
-        if "out.0.weight" in state_dict:
-            out_channels_detected = state_dict["out.0.weight"].shape[0]
-        elif "out.weight" in state_dict:
-            out_channels_detected = state_dict["out.weight"].shape[0]
-        model = UNet(in_channels=in_channels_detected, out_channels=out_channels_detected).to(_device)
-        load_res = model.load_state_dict(state_dict, strict=False)
-        if load_res.missing_keys or load_res.unexpected_keys:
-            print(f"[CAM{cam_index + 1}] UNet strict=False 加载 missing={len(load_res.missing_keys)}")
-        model.eval()
-        # 与 detectoutline02 一致：UNet 分支仅传基础参数（缺陷定位仍走 function_bank 内局部对比度等逻辑）
-        M = test_one_image(
-            model=model, conduct_id=conduct_id, fukuan0=fukuan0, cut_ratio=cut_ratio,
-            img_size=img_size, seg_anomaly_thres=seg_anomaly_thres,
-            standard_ratio_x=standard_ratio_x, standard_ratio_y=standard_ratio_y, steel_real_y0=steel_real_y0,
-        )
-
     F = get_one_image_list(cut_ratio=cut_ratio, standard_ratio_x=standard_ratio_x, fukuan0=fukuan0)
     Checker = Consecutive_anomaly_Checker(thres_num=Consecutive_thres_num, calibrate_cam=calibrat_cam_id)
     info_process = Anomaly_info_List(filepath=result_path)
 
     print(f"[OK] 相机 {cam_index + 1} 初始化完成（输入通道数={in_channels_detected}）。")
-    return M, F, Checker, info_process, result_path, in_channels_detected
+    return M, F, Checker, info_process, result_path, in_channels_detected, strip_dir_names
 
 
 
 # ------------------- 检测单条带钢（与 detectoutline02.detect 对齐） -------------------
 def detect(img, new_image_id, cam_id, strip_id, M, F, Checker, info_process, save_root,
            Consecutive_Check, image_anomaly_center_list, image_anomaly_area_list, fukuan_value,
-           model_channels=1):
+           model_channels=1, strip_dir_names=None):
     """
     与 detectoutline02.detect 一致：单帧序号 new_image_id 对该帧内各条带共用；
     save_root 为相机根目录（数字文件夹 1~4）。
     """
     global _created_dirs
 
-    strip_folder = os.path.join(save_root, f"strip_{strip_id + 1}")
+    try:
+        sid = int(strip_id)
+    except Exception:
+        sid = 0
+    if isinstance(strip_dir_names, (list, tuple)) and 0 <= sid < len(strip_dir_names) and str(strip_dir_names[sid]):
+        strip_base = str(strip_dir_names[sid])
+    else:
+        roll_root = os.path.dirname(save_root)
+        strip_base = _strip_paths.resolve_strip_dir_basename(roll_root, sid + 1)
+    strip_folder = os.path.join(save_root, strip_base)
     os.makedirs(strip_folder, exist_ok=True)
     defect_dir = os.path.join(strip_folder, "defect_images")
     os.makedirs(defect_dir, exist_ok=True)
@@ -858,7 +771,7 @@ def detect(img, new_image_id, cam_id, strip_id, M, F, Checker, info_process, sav
                 valid_mask[ec : Hm - ec, ec : Wm - ec] = 255
                 bg_k = getattr(locator, "bg_ksize", 101)
                 diff_th = getattr(locator, "diff_threshold", 1.0)
-                from patchcore_model.local_contrast_defect import debug_local_contrast_visualization
+                from models.patchcore_model.local_contrast_defect import debug_local_contrast_visualization
 
                 debug_path = os.path.join(debug_dir, f"debug_{new_image_id}.png")
                 amap_raw_dbg = getattr(M, "_last_amap_raw", None)
@@ -989,7 +902,7 @@ def process_image(image_data, history_image_id_list, index, cam_id,
                   M, F, Consecutive_Checker, anomaly_info_process,
                   anomaly_save_root, Consecutive_Check,
                   image_anomaly_center_list, image_anomaly_area_list, fukuan_list,
-                  model_channels=1):
+                  model_channels=1, strip_dir_names=None):
     nparr = np.frombuffer(image_data, np.uint8)
     gray_image = nparr.reshape((4096, 4096))
     img = np.stack((gray_image,) * 3, axis=-1)
@@ -1036,6 +949,7 @@ def process_image(image_data, history_image_id_list, index, cam_id,
             image_anomaly_area_list[cam_id][i],
             measured_widths_mm[i],
             model_channels=model_channels,
+            strip_dir_names=strip_dir_names,
         )
         print(f"Thread {cam_id + 1} processing image {index}... (strip {i + 1})")
 
@@ -1125,7 +1039,7 @@ def receive_images(sock, cam_id, image_queue):
 # ------------------------- GPU图像处理线程（切分/检测与 detectoutline02.worker 对齐） -------------------------
 def worker(image_queue, cam_id, history_image_id_list, M, F, Checker, info_process, save_root,
            Consecutive_Check, image_anomaly_center_list, image_anomaly_area_list, fukuan_list, fukuan_stabilizers,
-           model_channels=1, infer_engine=None, lite_cam_ids=frozenset()):
+           model_channels=1, strip_dir_names=None, infer_engine=None, lite_cam_ids=frozenset()):
     """
     image_queue: 每项 (data_bytes, idx)；若 data_bytes is None => 退出
     history_image_id_list: 长度=num_cams 的列表，每相机一个递增的 last_id（与 detectoutline02 一致）
@@ -1324,7 +1238,11 @@ def worker(image_queue, cam_id, history_image_id_list, M, F, Checker, info_proce
         if pause_event.is_set() or (cam_id in lite_cam_ids):
             now_ts = time.time()
             for _, nid, sid, raw_fw, stable_fw, valid, reason, s_mode, f0, limits in strip_tasks:
-                base = os.path.join(save_root, f"strip_{sid + 1}")
+                if isinstance(strip_dir_names, (list, tuple)) and 0 <= int(sid) < len(strip_dir_names) and str(strip_dir_names[int(sid)]):
+                    strip_base = str(strip_dir_names[int(sid)])
+                else:
+                    strip_base = _strip_paths.resolve_strip_dir_basename(os.path.dirname(save_root), int(sid) + 1)
+                base = os.path.join(save_root, strip_base)
                 stable_path = os.path.join(base, "fukuan.json")
                 raw_path = os.path.join(base, "fukuan_raw.json")
                 meta_path = os.path.join(base, "fukuan_meta.json")
@@ -1369,6 +1287,7 @@ def worker(image_queue, cam_id, history_image_id_list, M, F, Checker, info_proce
                     image_anomaly_area_list[sid],
                     stable_fw,
                     model_channels=model_channels,
+                    strip_dir_names=strip_dir_names,
                 )
                 futures.append(future)
             # 等待本帧所有条带推理完成
@@ -1389,6 +1308,7 @@ def worker(image_queue, cam_id, history_image_id_list, M, F, Checker, info_proce
                         image_anomaly_area_list[sid],
                         stable_fw,
                         model_channels=model_channels,
+                        strip_dir_names=strip_dir_names,
                     )
                 except Exception as e:
                     print(f"[ERR] {local_name} detect error strip{sid} idx={idx}: {e}")
@@ -1398,7 +1318,11 @@ def worker(image_queue, cam_id, history_image_id_list, M, F, Checker, info_proce
         try:
             now_ts = time.time()
             for _, nid, sid, raw_fw, stable_fw, valid, reason, s_mode, f0, limits in strip_tasks:
-                base = os.path.join(save_root, f"strip_{sid + 1}")
+                if isinstance(strip_dir_names, (list, tuple)) and 0 <= int(sid) < len(strip_dir_names) and str(strip_dir_names[int(sid)]):
+                    strip_base = str(strip_dir_names[int(sid)])
+                else:
+                    strip_base = _strip_paths.resolve_strip_dir_basename(os.path.dirname(save_root), int(sid) + 1)
+                base = os.path.join(save_root, strip_base)
                 stable_path = os.path.join(base, "fukuan.json")
                 raw_path = os.path.join(base, "fukuan_raw.json")
                 meta_path = os.path.join(base, "fukuan_meta.json")
@@ -1492,6 +1416,7 @@ def run_online(cwd_base_result=None):
     conduct_id = config0["conduct_id"]
     _, fukuan0 = get_strip_count_and_fukuan(config0)
     num_strips = len(fukuan0)
+    roll_strip_dir_names = _strip_paths.build_strip_dir_names(config0, int(num_strips))
 
     # 结果路径
     if cwd_base_result:
@@ -1505,8 +1430,11 @@ def run_online(cwd_base_result=None):
     # 写入 config0 快照：供报告中心/修改界面直接读取带钢卡号（无需先生成报告）
     try:
         snap0 = os.path.join(base_result_path, "config0_snapshot.yaml")
+        snap_obj = dict(config0 or {})
+        # 关键：记录“实际落盘目录名”（sanitize+去重后），避免 UI/报告侧靠猜测重建不一致
+        snap_obj["strip_dir_list"] = list(roll_strip_dir_names)
         with open(snap0, "w", encoding="utf-8") as f:
-            yaml.dump(dict(config0 or {}), f, allow_unicode=True)
+            yaml.dump(snap_obj, f, allow_unicode=True)
     except Exception:
         pass
 
@@ -1523,7 +1451,7 @@ def run_online(cwd_base_result=None):
     _debug_io = bool(config.get("debug_io", False))
     speed_monitor.set_debug_io(_debug_io)
     if _debug_io:
-        print("[config] debug_io=ON：将写入每相机 save_root/split_vis/ 与 strip_*/debug_visuals/")
+        print("[config] debug_io=ON：将写入每相机 save_root/split_vis/ 与 <带钢目录>/debug_visuals/")
 
     ports = [8885, 8886, 8887, 8888]
     num_cams = len(ports)
@@ -1608,7 +1536,7 @@ def run_online(cwd_base_result=None):
     for cam_id in active_cam_ids:
         port = ports[cam_id]
         # init per-camera detector (尽量只初始化一次)
-        M, F, Checker, info_process, save_root, in_channels_detected = init_detect(
+        M, F, Checker, info_process, save_root, in_channels_detected, _ = init_detect(
             conduct_id, base_result_path, Consecutive_thres_num, cam_id
         )
 
@@ -1640,6 +1568,7 @@ def run_online(cwd_base_result=None):
                     M, F, Checker, info_process, save_root, Consecutive_Check,
                     image_anomaly_center_list[cam_id], image_anomaly_area_list[cam_id], fukuan_list[cam_id], fukuan_stabilizers[cam_id],
                     in_channels_detected,
+                    roll_strip_dir_names,
                 ),
                 kwargs={"infer_engine": cam_infer_engine, "lite_cam_ids": lite_cam_ids},
                 daemon=True
@@ -1733,9 +1662,15 @@ if __name__ == "__main__":
 
     if folder_id_now:
         result_path_all = folder_id_now[0]
+        strip_dir_names = _strip_paths.strip_dir_list_from_roll(result_path_all, int(num_strips))
         for cam_idx in active_cam_ids:
             for strip_idx in range(num_strips):
-                folder_path = os.path.join(result_path_all, _cam_output_folder_name(cam_idx), f"strip_{strip_idx + 1}")
+                strip_base = (
+                    strip_dir_names[strip_idx]
+                    if isinstance(strip_dir_names, list) and strip_idx < len(strip_dir_names) and strip_dir_names[strip_idx]
+                    else f"strip_{strip_idx + 1}"
+                )
+                folder_path = os.path.join(result_path_all, _cam_output_folder_name(cam_idx), strip_base)
                 try:
                     with open(os.path.join(folder_path, "image_anomaly_center.json"), 'r', encoding='utf-8') as file:
                         image_anomaly_center_list[cam_idx][strip_idx] = fix_json(file.read())

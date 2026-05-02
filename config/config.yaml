@@ -1,140 +1,80 @@
-# 调试写盘：true 时每帧写 split_vis（整图切分框）+ 各条带 debug_visuals；生产请改 false
-debug_io: false
-# 速度测试：终端汇总间隔（秒）。各相机接收fps/处理fps/队列/分阶段耗时；可改为 1.0 更密
-speed_report_interval_sec: 5.0
-
-# 产线静止追平：界面判定「静止」且检测未暂停时，worker 在一轮 get 后连续消化队列（给推理腾时间）
-# line_idle_stale_sec：距 line_heartbeat.json 收图时间超过该秒数视为静止，才触发追平
-# line_idle_catchup_max_frames：单次最多连处理帧数，避免长时间占用 worker
-line_idle_catchup_enable: true
-line_idle_stale_sec: 2.0
-line_idle_catchup_max_frames: 40
-
-# 主界面「缺陷位置 + 幅宽」共用长度窗口（检测滞后时可加大窗口与回溯）
-ui_defect_window_target_m: 30.0
-ui_defect_window_max_mm: 300000
-ui_defect_backtrack_max_mm: 150000
-ui_defect_lag_margin_mm: 20000
-# 缺陷坐标 JSON 轮询间隔（毫秒）；积压大时线程内会提高单次读取条数
-ui_defect_coord_poll_ms: 500
-# 长度轴非线性：将尾部一段物理区间压到更少像素（false 则全程线性）
-ui_defect_axis_nonlinear: false
-# 窗口右端尾部占物理窗口长度的比例（与非线性配合）
-ui_defect_axis_tail_phys_ratio: 0.35
-# 尾部在上述物理比例内时，占用横轴像素宽度的比例（越小尾部越「挤」）
-ui_defect_axis_tail_pixel_ratio: 0.2
-
-# 缺陷坐标长期运行稳定性（推荐 jsonl：增量追加 + UI 追尾读取，避免 image_anomaly_center.json 越来越大导致 UI 停更）
-detect_coord_format: jsonl          # jsonl | legacy_json
-ui_coord_source: jsonl              # jsonl | legacy_json
-ui_coord_max_lines_per_tick: 200    # UI 单次最多处理多少行事件，防止卡顿
-coord_jsonl_rotate_mb: 64           # jsonl 单文件超过该大小(MB)自动轮转
-
-# 幅宽“永不离谱跳变”保护（Raw/Stable 双轨；Stable 写入 strip_x/fukuan.json 供 UI 使用）
-# abs/rel：与标称幅宽 f0 的允许范围（取交集）；max_step：Stable 单步最大跳变（mm）
-fukuan_stable_abs_tol_mm: 120
-fukuan_stable_rel_tol: 0.25
-fukuan_stable_max_step_mm: 60
-# 下列 mode 将被直接判定为低置信度（Raw 记录但 Stable 不更新）
-fukuan_reject_modes: ["fallback_uniform", "fallback_legacy_valley_3"]
-# UI 是否在幅宽状态中展示 Raw/mode/reason 提示（检测端仍会记录 fukuan_meta.json）
-ui_show_fukuan_raw_tooltip: true
-
 Consecutive_Check: 0
 Consecutive_thres_num: 30
+active_cam_ids:
+- 1
+- 2
 anomaly_area_cls_range:
--   - 0
-    - 20
--   - 20
-    - 40
--   - 40
-    - 60
--   - 60
-    - 80
--   - 80
-    - 100
+- - 0
+  - 20
+- - 20
+  - 40
+- - 40
+  - 60
+- - 60
+  - 80
+- - 80
+  - 100
 calibrat_cam_id: 2
-cam1_cut_ratio: 3
-cam1_img_size: 256
-cam1_model_name: det_model\train-result\image_data_02_28\CAM1\last.pth
-cam1_eff_ad_ckpt: eff_ad\train-result\image_data_02_27\CAM1\last.pth
-cam1_draem_ckpt: draem_model\train-result\image_data_02_27\CAM1\last.pth
-cam1_draem_seg_anomaly_thres: 0.004
-cam1_seg_anomaly_thres: 0.0
-cam1_patchcore_k: 3.0
-cam1_use_gradient_detection: true
-cam1_grad_threshold: 10
-cam1_blur_ksize: 5
-cam1_edge_crop: 0
 cam1_bg_ksize: 201
+cam1_blur_ksize: 5
+cam1_cut_ratio: 3
 cam1_diff_threshold: 0.5
-# PatchCore：每块正方形热力图边缘抑制
-#   soft_border：过渡带宽（像素），0 表示不按带宽做边缘抑制
-#   strength：抑制强度 0~1，0=完全不抑制，1=最外缘一行/列热力乘权为 0（向内恢复）
-#   weight_profile：过渡曲线。linear=线性 ramp；ease_out_cubic=默认，w=1-(1-t)^3，靠外缘变化快、
-#     靠内缘趋近 1 更缓，减轻后续 H_diff 在「抑制带末端」的伪高亮
+cam1_edge_crop: 0
+cam1_grad_threshold: 10
+cam1_img_size: 256
 cam1_patchcore_edge_soft_border: 50
 cam1_patchcore_edge_strength: 0.5
 cam1_patchcore_edge_weight_profile: ease_out_cubic
+cam1_patchcore_k: 3.0
+cam1_seg_anomaly_thres: 0.0
 cam1_standard_ratio_x: 0.4308
 cam1_times: 0.858658
-cam2_cut_ratio: 3
-cam2_img_size: 256
-cam2_model_name: det_model\train-result\image_data_02_28\CAM2\last.pth
-cam2_eff_ad_ckpt: eff_ad\train-result\image_data_02_27\CAM2\last.pth
-cam2_draem_ckpt: draem_model\train-result\image_data_02_27\CAM2\last.pth
-cam2_draem_seg_anomaly_thres: 0.004
-cam2_seg_anomaly_thres: 0.3
-cam2_patchcore_k: 3.0
-cam2_use_gradient_detection: true
-cam2_grad_threshold: 3.5
-cam2_blur_ksize: 5
-cam2_edge_crop: 0
+cam1_use_gradient_detection: true
 cam2_bg_ksize: 101
+cam2_blur_ksize: 5
+cam2_cut_ratio: 3
 cam2_diff_threshold: 0.3
+cam2_edge_crop: 0
+cam2_grad_threshold: 3.5
+cam2_img_size: 256
 cam2_patchcore_edge_soft_border: 100
-cam2_patchcore_edge_strength: 0.5
+cam2_patchcore_edge_strength: 0.8
 cam2_patchcore_edge_weight_profile: ease_out_cubic
+cam2_patchcore_k: 3.0
+cam2_seg_anomaly_thres: 0.3
 cam2_standard_ratio_x: 0.4578
 cam2_times: 0.8080166
-cam3_cut_ratio: 3
-cam3_img_size: 256
-cam3_model_name: det_model\train-result\image_data_02_28\CAM3\last.pth
-cam3_eff_ad_ckpt: eff_ad\train-result\image_data_02_27\CAM3\last.pth
-cam3_draem_ckpt: draem_model\train-result\image_data_02_27\CAM3\last.pth
-cam3_draem_seg_anomaly_thres: 0.004
-cam3_seg_anomaly_thres: 0.3
-cam3_patchcore_k: 3.0
-cam3_use_gradient_detection: true
-cam3_grad_threshold: 2
-cam3_blur_ksize: 5
-cam3_edge_crop: 0
+cam2_use_gradient_detection: true
 cam3_bg_ksize: 101
+cam3_blur_ksize: 5
+cam3_cut_ratio: 3
 cam3_diff_threshold: 0.3
+cam3_edge_crop: 0
+cam3_grad_threshold: 2
+cam3_img_size: 256
 cam3_patchcore_edge_soft_border: 100
-cam3_patchcore_edge_strength: 0.5
+cam3_patchcore_edge_strength: 0.8
 cam3_patchcore_edge_weight_profile: ease_out_cubic
+cam3_patchcore_k: 3.0
+cam3_seg_anomaly_thres: 0.3
 cam3_standard_ratio_x: 0.4578
 cam3_times: 0.8080166
-cam4_cut_ratio: 3
-cam4_img_size: 256
-cam4_model_name: det_model\train-result\image_data_02_28\CAM4\last.pth
-cam4_eff_ad_ckpt: eff_ad\train-result\image_data_02_27\CAM4\last.pth
-cam4_draem_ckpt: draem_model\train-result\image_data_02_27\CAM4\last.pth
-cam4_draem_seg_anomaly_thres: 0.004
-cam4_seg_anomaly_thres: 0.3
-cam4_patchcore_k: 3.0
-cam4_use_gradient_detection: true
-cam4_grad_threshold: 2
-cam4_blur_ksize: 5
-cam4_edge_crop: 0
+cam3_use_gradient_detection: true
 cam4_bg_ksize: 201
+cam4_blur_ksize: 5
+cam4_cut_ratio: 3
 cam4_diff_threshold: 0.5
+cam4_edge_crop: 0
+cam4_grad_threshold: 2
+cam4_img_size: 256
 cam4_patchcore_edge_soft_border: 50
 cam4_patchcore_edge_strength: 0.5
 cam4_patchcore_edge_weight_profile: ease_out_cubic
+cam4_patchcore_k: 3.0
+cam4_seg_anomaly_thres: 0.3
 cam4_standard_ratio_x: 0.4368
 cam4_times: 0.83572
+cam4_use_gradient_detection: true
 camrea_id_down:
 - '3'
 - '4'
@@ -145,22 +85,39 @@ camrea_id_up:
 - '2'
 camrea_id_up_cls: 2
 camrea_id_up_report: '2'
-cls_model_path: cls_model\cls_checkpoint.pth
+cleanup_unused_cam_dirs: true
+cls_model_path: cls_model\train-result\20260501_121549\cls_checkpoint.pth
+coord_jsonl_rotate_mb: 64
+debug_io: false
+detect_coord_format: jsonl
 diameter: 607.9
 frequency_bianma: 1000
 frequency_bianma_times: 8
+fukuan_reject_modes:
+- fallback_uniform
+- fallback_legacy_valley_3
+fukuan_stable_abs_tol_mm: 120
+fukuan_stable_max_step_mm: 60
+fukuan_stable_rel_tol: 0.25
+line_idle_catchup_enable: true
+line_idle_catchup_max_frames: 40
+line_idle_stale_sec: 2.0
+lite_cam_ids:
+- 0
+- 3
+patchcore_weights_root: weights
 remove_threshold: 15
+speed_report_interval_sec: 5.0
 steel_length_range: []
 steel_real_y0: 0
-# 轻量模式相机（0-based）：这些相机只测量幅宽，跳过全量缺陷检测，以释放 GPU 给主检相机（CAM2/CAM3）
-# CAM1=0, CAM2=1, CAM3=2, CAM4=3；改为 [] 可恢复所有相机全量检测
-lite_cam_ids: [0, 3]
-
-# 实际启用采集/检测的相机（0-based）。你当前需求：只保留 CAM2/CAM3，并将输出目录命名为 上表面/下表面。
-active_cam_ids: [1, 2]
-# 是否在启动时清理未启用相机目录（如 1/4 旧目录）。true=自动删除，false=保留旧数据。
-cleanup_unused_cam_dirs: true
-# PatchCore 权重目录名（相对于 patchcore_model/ 下）
-# 使用原版模型：weights
-# 使用 train_v2.py 训练的提速模型（coreset 1% + PCA）：weights_v2
-patchcore_weights_root: weights
+ui_coord_max_lines_per_tick: 200
+ui_coord_source: jsonl
+ui_defect_axis_nonlinear: false
+ui_defect_axis_tail_phys_ratio: 0.35
+ui_defect_axis_tail_pixel_ratio: 0.2
+ui_defect_backtrack_max_mm: 150000
+ui_defect_coord_poll_ms: 500
+ui_defect_lag_margin_mm: 20000
+ui_defect_window_max_mm: 300000
+ui_defect_window_target_m: 30.0
+ui_show_fukuan_raw_tooltip: true

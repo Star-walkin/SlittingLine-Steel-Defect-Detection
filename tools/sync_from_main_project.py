@@ -49,6 +49,8 @@ UI_FILES = [
 ]
 
 ROOT_FILE_MAP = {
+    # UI 与检测端共用的条带目录名解析（与主工程根目录 strip_result_paths.py 对齐）
+    "strip_result_paths.py": Path("strip_result_paths.py"),
     # online / report entrypoints
     "detect_anomalies_online.py": Path("app") / "online" / "detect_anomalies_online.py",
     "gen_report_cls.py": Path("app") / "report" / "gen_report_cls.py",
