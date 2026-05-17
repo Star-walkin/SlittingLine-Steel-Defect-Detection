@@ -20,6 +20,7 @@ _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 from datetime import datetime, timedelta
 import torch.nn.functional as F
 import itertools
+import colorsys
 import sys
 
 try:
@@ -1548,22 +1549,56 @@ class Statistic_anomaly:
         # 创建一个新的图像
         matplotlib.rcParams['font.sans-serif'] = ['SimHei']  # 黑体
         fig, ax = plt.subplots(figsize=(10, 3))
-        # colors 配置可能缺项（例如 class_labels 改名但 colors 未同步），这里给一个稳定回退色，避免 KeyError 中断报告生成
+        # 缺陷分布散点图：同一图内「不同缺陷类别」必须使用可区分颜色（配置优先；重复或缺项则自动错开）。
         default_cycle = [
             "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728",
             "#9467bd", "#8c564b", "#e377c2", "#7f7f7f",
             "#bcbd22", "#17becf",
         ]
+        def _norm_color_key(s) -> str:
+            t = (s or "").strip()
+            if not t:
+                return ""
+            return t.lower()
+
+        labels_with_points = [
+            lab for lab, pts in (coordinates or {}).items() if pts and len(pts) > 0
+        ]
+        labels_sorted = sorted(labels_with_points, key=lambda x: str(x))
+        cfg_colors = self.colors if isinstance(self.colors, dict) else {}
+        color_by_label = {}
+        used = set()
+        for i, lab in enumerate(labels_sorted):
+            cand = None
+            try:
+                cand = cfg_colors.get(lab)
+            except Exception:
+                cand = None
+            if cand is not None and str(cand).strip():
+                key = _norm_color_key(str(cand))
+                if key and key not in used:
+                    color_by_label[lab] = str(cand).strip()
+                    used.add(key)
+                    continue
+            placed = False
+            for p in default_cycle:
+                pk = _norm_color_key(p)
+                if pk and pk not in used:
+                    color_by_label[lab] = p
+                    used.add(pk)
+                    placed = True
+                    break
+            if not placed:
+                h = ((i + 1) * 0.618033988749895) % 1.0
+                r, g, b = colorsys.hsv_to_rgb(h, 0.72, 0.92)
+                hx = "#{:02x}{:02x}{:02x}".format(
+                    int(r * 255), int(g * 255), int(b * 255)
+                )
+                color_by_label[lab] = hx
+                used.add(hx.lower())
 
         def _pick_color(label: str) -> str:
-            try:
-                c = self.colors.get(label, None) if isinstance(self.colors, dict) else None
-                if c:
-                    return c
-            except Exception:
-                pass
-            idx = abs(hash(str(label))) % len(default_cycle)
-            return default_cycle[idx]
+            return color_by_label.get(label, default_cycle[0])
 
         # 横轴：钢带长度(km)；纵轴：缺陷在宽度方向的坐标(mm)。
         # 检测端 obtain_anomaly_location 里 real_x 按「当时传入的 fukuan_val（多为实测幅宽）」映射，
@@ -1873,18 +1908,21 @@ class Anomaly_info_List:
         def _maybe_load_from_jsonl(base_dir, listname):
             """
             当 legacy JSON 不存在时，从 JSONL 事件流聚合为旧结构返回。
-            - image_anomaly_center.json -> defect_events_center.jsonl
-            结构：list[frame_points]，其中 frame_points = [[x,y], ...]
+            - image_anomaly_center.json / image_anomaly_area.json
+              均读取 defect_events_center.jsonl（每行一帧；含 points、areas）。
+            结构：list[frame]，每帧 center 为 [[x,y], ...]（可为 []），area 为 [int, ...]（可为 []）。
             """
             try:
                 ln = str(listname or "")
-                if "image_anomaly_center" in ln:
-                    jsonl = os.path.join(base_dir, "defect_events_center.jsonl")
-                else:
+                want_center = "image_anomaly_center" in ln
+                want_area = "image_anomaly_area" in ln
+                if not want_center and not want_area:
                     return None
+                jsonl = os.path.join(base_dir, "defect_events_center.jsonl")
                 if not os.path.exists(jsonl):
                     return None
-                out = []
+                out_center = []
+                out_area = []
                 with open(jsonl, "r", encoding="utf-8") as f:
                     for line in f:
                         s = line.strip()
@@ -1896,17 +1934,33 @@ class Anomaly_info_List:
                             continue
                         pts = ev.get("points", [])
                         if not isinstance(pts, list):
-                            continue
-                        frame = []
+                            pts = []
+                        frame_c = []
                         for p in pts:
                             try:
                                 x, y = p
-                                frame.append([float(x), float(y)])
+                                frame_c.append([float(x), float(y)])
                             except Exception:
                                 continue
-                        if frame:
-                            out.append(frame)
-                return out
+                        out_center.append(frame_c)
+                        ars = ev.get("areas", [])
+                        if not isinstance(ars, list):
+                            ars = []
+                        frame_a = []
+                        for a in ars:
+                            try:
+                                frame_a.append(int(a))
+                            except Exception:
+                                try:
+                                    frame_a.append(int(float(a)))
+                                except Exception:
+                                    pass
+                        out_area.append(frame_a)
+                if want_center:
+                    return out_center
+                if want_area:
+                    return out_area
+                return None
             except Exception:
                 return None
 

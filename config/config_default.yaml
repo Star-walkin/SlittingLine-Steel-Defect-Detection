@@ -16,22 +16,23 @@ cam1_cut_ratio: 3
 cam1_img_size: 256
 cam1_seg_anomaly_thres: 0.065
 cam1_standard_ratio_x: 0.424793
-cam1_times: 0.865127
+# 同上：ratio_y≈0.432333（85m/min ÷ 0.8fps ÷ 4096px）
+cam1_times: 1.017749
 cam2_cut_ratio: 3
 cam2_img_size: 256
 cam2_seg_anomaly_thres: 0.065
 cam2_standard_ratio_x: 0.45249
-cam2_times: 0.8121726
+cam2_times: 0.954569
 cam3_cut_ratio: 3
 cam3_img_size: 256
 cam3_seg_anomaly_thres: 0.085
 cam3_standard_ratio_x: 0.43617
-cam3_times: 0.842561
+cam3_times: 0.991202
 cam4_cut_ratio: 3
 cam4_img_size: 256
 cam4_seg_anomaly_thres: 0.065
 cam4_standard_ratio_x: 0.43974
-cam4_times: 0.83572
+cam4_times: 0.983157
 camrea_id_down_report: '3'
 camrea_id_up_report: '2'
 camrea_id_down:

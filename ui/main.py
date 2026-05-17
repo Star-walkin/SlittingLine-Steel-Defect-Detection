@@ -3,7 +3,20 @@ try:
     from PyQt5 import QtWidgets, QtCore
     from PyQt5.QtWidgets import QInputDialog, QMessageBox, QLineEdit, QComboBox
     from PyQt5.QtGui import QPixmap, QPainter, QPen, QFont, QFontMetrics, QDesktopServices
-    from PyQt5.QtCore import QRect, Qt, QTimer, QThread, pyqtSignal, QProcess, QEvent, QUrl
+    from PyQt5.QtCore import (
+        QRect,
+        Qt,
+        QTimer,
+        QThread,
+        pyqtSignal,
+        pyqtSlot,
+        QProcess,
+        QEvent,
+        QUrl,
+        QMetaObject,
+        QElapsedTimer,
+        QEventLoop,
+    )
     from PyQt5.QtWidgets import (
         QApplication,
         QWidget,
@@ -18,7 +31,20 @@ except ModuleNotFoundError:
     from PySide6 import QtWidgets, QtCore
     from PySide6.QtWidgets import QInputDialog, QMessageBox, QLineEdit, QComboBox
     from PySide6.QtGui import QPixmap, QPainter, QPen, QFont, QFontMetrics, QDesktopServices
-    from PySide6.QtCore import QRect, Qt, QTimer, QThread, Signal as pyqtSignal, QProcess, QEvent, QUrl
+    from PySide6.QtCore import (
+        QRect,
+        Qt,
+        QTimer,
+        QThread,
+        Signal as pyqtSignal,
+        Slot as pyqtSlot,
+        QProcess,
+        QEvent,
+        QUrl,
+        QMetaObject,
+        QElapsedTimer,
+        QEventLoop,
+    )
     from PySide6.QtWidgets import (
         QApplication,
         QWidget,
@@ -43,6 +69,7 @@ import sys
 import os
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 import time
+import traceback
 import subprocess
 import json
 import json
@@ -187,14 +214,14 @@ def _defect_length_mm_to_px(y_mm, start_mm, end_mm, x_max_px, ui):
     return px_left + (y - split_mm) / denom * px_right
 
 
-# ---------- 幅宽偏窄判定（工程容差，整体偏宽松）----------
-# 「显著偏窄」下阈值 = 设定幅宽 − max(绝对容差mm, 设定×相对比例)，仅当实测低于该阈值才计入预警/报警统计。
-# 这样测量噪声、标定误差和正常工艺波动不会一碰就报警。
+# ---------- 幅宽允许带判定（对称容差：偏窄 / 偏宽均视为「超出范围」）----------
+# 下阈值 = 设定 − max(绝对容差mm, 设定×相对比例)；上阈值 = 设定 + 同带宽。
+# 测量噪声、标定误差和正常工艺波动不会一碰就报警。
 FUKUAN_NARROW_ABS_MM = 12.0
 FUKUAN_NARROW_REL = 0.025
-# 历史序列中连续「显著偏窄」采样数达到以下值 → 报警（原 10 帧、零容差；现加长链、带容差）
-FUKUAN_ALARM_CONSEC = 16
-# 当前序列末尾连续「显著偏窄」采样数达到以下值 → 预警（未达报警）
+# 报警：最近 N 帧全部超出允许范围（过窄或过宽）
+FUKUAN_ALARM_WINDOW = 32
+# 预警：当前序列末尾连续超出范围帧数达到以下值，且未满足上述报警
 FUKUAN_WARN_TAIL_STREAK = 6
 
 
@@ -204,6 +231,23 @@ def fukuan_narrow_threshold_mm(baseline_mm: float) -> float:
         return float("inf")
     band = max(FUKUAN_NARROW_ABS_MM, float(baseline_mm) * FUKUAN_NARROW_REL)
     return float(baseline_mm) - band
+
+
+def fukuan_wide_threshold_mm(baseline_mm: float) -> float:
+    """高于此实测值视为「显著偏宽」（与偏窄使用同一带宽）。"""
+    if baseline_mm is None or baseline_mm <= 0:
+        return float("-inf")
+    band = max(FUKUAN_NARROW_ABS_MM, float(baseline_mm) * FUKUAN_NARROW_REL)
+    return float(baseline_mm) + band
+
+
+def fukuan_out_of_range_mm(measured_mm: float, baseline_mm: float) -> bool:
+    """实测超出允许带（偏窄或偏宽）。"""
+    if baseline_mm is None or baseline_mm <= 0:
+        return False
+    lo = fukuan_narrow_threshold_mm(float(baseline_mm))
+    hi = fukuan_wide_threshold_mm(float(baseline_mm))
+    return float(measured_mm) < lo or float(measured_mm) > hi
 
 
 def fukuan_is_significantly_narrow(measured_mm: float, baseline_mm: float) -> bool:
@@ -217,6 +261,9 @@ FUKUAN_STATUS_TITLE_H = 22
 FUKUAN_STATUS_TITLE_PANEL_GAP = 6
 FUKUAN_STATUS_PANEL_H = 118
 FUKUAN_STRIP_DEFAULT_W = 1761
+
+# 幅宽曲线内存与插值窗口：避免 fukuan.json 极长时 UI 内存与 CPU 线性爆炸
+TOTAL_DATA_MAX_SAMPLES = 10000
 
 
 def _fukuan_layout_metrics(inner_width: int):
@@ -257,7 +304,7 @@ def _apply_app_theme(app: QtWidgets.QApplication) -> None:
 
 
 class WaveformThread(QThread):
-    # data, has_abnormal, detection_system_index, last_measured_mm, tail_narrow_streak
+    # data, has_abnormal, detection_system_index, last_measured_mm, tail_out_of_range_streak
     # meta: dict from fukuan_meta.json last entry (may be None)
     update_signal = pyqtSignal(list, bool, int, float, int, object)
 
@@ -276,37 +323,66 @@ class WaveformThread(QThread):
     @staticmethod
     def _analyze_fukuan_series(values, baseline_width):
         """
-        返回 (是否存在「连续多帧显著偏窄」报警, 最新实测mm, 末尾连续显著偏窄帧数)。
-        显著偏窄：实测 < fukuan_narrow_threshold_mm(设定)，含绝对+相对容差。
+        返回 (是否报警, 最新实测mm, 末尾连续超出允许范围帧数)。
+        允许范围：[fukuan_narrow_threshold_mm, fukuan_wide_threshold_mm]（对称容差）。
+        报警：序列长度 ≥ FUKUAN_ALARM_WINDOW，且最近 FUKUAN_ALARM_WINDOW 帧全部超出允许范围。
         """
         if not values or baseline_width <= 0:
             return False, float("nan"), 0
-        th = fukuan_narrow_threshold_mm(float(baseline_width))
+        bl = float(baseline_width)
         nums = [float(v) for v in values]
         last_mm = nums[-1]
+
+        def _oor(v: float) -> bool:
+            return fukuan_out_of_range_mm(v, bl)
+
         tail = 0
         for v in reversed(nums):
-            if v < th:
+            if _oor(v):
                 tail += 1
             else:
                 break
-        count = 0
-        has_abnormal = False
-        for v in nums:
-            if v < th:
-                count += 1
-                if count >= FUKUAN_ALARM_CONSEC:
-                    has_abnormal = True
-                    break
-            else:
-                count = 0
+
+        w = int(FUKUAN_ALARM_WINDOW)
+        n = len(nums)
+        has_abnormal = n >= w and all(_oor(v) for v in nums[-w:])
         return has_abnormal, last_mm, tail
 
     def run(self):
+        # 禁止 QTimer(self)：QThread 对象属于主线程 affinity，在工作线程里给其挂子对象会触发 Qt 跨线程告警，
+        # 且在暂停/关闭时 stop timer 可能报错并导致进程崩溃。
         self.timer = QTimer()
+        self.timer.setTimerType(Qt.CoarseTimer)
         self.timer.timeout.connect(self.fukuan)
         self.timer.start(2000)
         self.exec_()
+
+    @pyqtSlot()
+    def _stop_in_thread(self):
+        try:
+            if hasattr(self, "timer") and self.timer is not None:
+                self.timer.stop()
+                self.timer = None
+        except Exception:
+            pass
+        try:
+            self.quit()
+        except Exception:
+            pass
+
+    def stop(self, blocking_ms=8000):
+        if not self.isRunning():
+            return
+        self._is_running = False
+        # 禁止 BlockingQueuedConnection：主线程在 fukuan() 未返回时无法处理 stop 槽，会死锁卡死 UI。
+        try:
+            QMetaObject.invokeMethod(self, "_stop_in_thread", Qt.QueuedConnection)
+        except Exception:
+            try:
+                self.quit()
+            except Exception:
+                pass
+        self.wait(int(blocking_ms))
 
     def find_folders_with_id0(self, base_path, product_id):
         now = datetime.now()
@@ -350,6 +426,8 @@ class WaveformThread(QThread):
         # 这里做短重试，避免 UI 因竞争导致长期显示缺失
         last_err = None
         for _ in range(3):
+            if not getattr(self, "_is_running", True):
+                return []
             try:
                 if (not os.path.exists(file_path)) or os.path.getsize(file_path) == 0:
                     return []
@@ -363,6 +441,8 @@ class WaveformThread(QThread):
 
     def fukuan(self):
         try:
+            if not getattr(self, "_is_running", True):
+                return
             with open(os.path.join(_REPO_ROOT, 'config', 'config0.yaml'), 'r', encoding='utf-8') as file:
                 config0 = yaml.safe_load(file)
 
@@ -431,9 +511,6 @@ class WaveformThread(QThread):
             print(f"检测系统{self.detection_system_index}读取数据失败: {e}")
             self.update_signal.emit([], False, self.detection_system_index, float("nan"), 0, None)
 
-    def stop(self):
-        self._is_running = False
-        self.wait()
 class ImageLoaderThread(QThread):
     # x: 宽度坐标(mm)，y: 长度坐标(mm)
     # c_m: 当前长度段索引（用于刷新X轴刻度）
@@ -481,9 +558,37 @@ class ImageLoaderThread(QThread):
             pass
         poll_ms = max(100, min(poll_ms, 5000))
         self.timer = QTimer()
+        self.timer.setTimerType(Qt.CoarseTimer)
         self.timer.timeout.connect(self.read_coordinates)
         self.timer.start(poll_ms)
         self.exec_()
+
+    @pyqtSlot()
+    def _stop_in_thread(self):
+        try:
+            if hasattr(self, "timer") and self.timer is not None:
+                self.timer.stop()
+                self.timer = None
+        except Exception:
+            pass
+        try:
+            self.quit()
+        except Exception:
+            pass
+
+    def stop(self, blocking_ms=8000):
+        if not self.isRunning():
+            return
+        self._is_running = False
+        # 与 WaveformThread 相同：避免 BlockingQueuedConnection 在 read_coordinates 耗时期间死锁 UI。
+        try:
+            QMetaObject.invokeMethod(self, "_stop_in_thread", Qt.QueuedConnection)
+        except Exception:
+            try:
+                self.quit()
+            except Exception:
+                pass
+        self.wait(int(blocking_ms))
 
     def find_folders_with_id(self, base_path, product_id):
         now = datetime.now()
@@ -519,6 +624,8 @@ class ImageLoaderThread(QThread):
 
     def read_coordinates(self):
         try:
+            if not getattr(self, "_is_running", True):
+                return
             # UI 读取来源开关（默认 jsonl）
             ui_coord_source = "jsonl"
             max_lines = 200
@@ -645,6 +752,8 @@ class ImageLoaderThread(QThread):
 
                 processed = 0
                 for ln in ready:
+                    if not getattr(self, "_is_running", True):
+                        return
                     if processed >= max_lines:
                         break
                     s = (ln or "").strip()
@@ -659,6 +768,8 @@ class ImageLoaderThread(QThread):
                         continue
                     # 每行可能包含多个点；按点 emit（保持现有 UI 缓存/按钮逻辑不变）
                     for p in pts:
+                        if not getattr(self, "_is_running", True):
+                            return
                         if processed >= max_lines:
                             break
                         try:
@@ -721,6 +832,8 @@ class ImageLoaderThread(QThread):
                 last_err = None
                 # 并发写入时可能读到半截 JSON：短重试，失败不清空旧数据
                 for _ in range(3):
+                    if not getattr(self, "_is_running", True):
+                        return
                     try:
                         if os.path.getsize(coord_file_path) == 0:
                             last_err = ValueError("empty file")
@@ -763,6 +876,8 @@ class ImageLoaderThread(QThread):
                 else:
                     read_count = min(10, remaining)
                 for i in range(read_count):
+                    if not getattr(self, "_is_running", True):
+                        return
                     if self.position < len(self.all_coordinates):
                         x, y = self.all_coordinates[self.position]
                         current_multiple = int(y // 1720)
@@ -887,9 +1002,19 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
 
         self.render_timer = QTimer(self)
         self.render_timer.timeout.connect(self.update_all_plots)
-        # 约 30 FPS，配合浮点插值游标，滑动更顺滑
-        self.render_timer.start(33)
+        # 约 12.5 FPS：降低 YAML/插值/重绘负载，幅宽曲线仍足够流畅
+        self.render_timer.start(80)
 
+        # update_all_plots 用：config.yaml / config0.yaml 按 mtime 缓存，避免每帧解析
+        self._plot_cfg_yaml_path = os.path.join(_REPO_ROOT, "config", "config.yaml")
+        self._plot_cfg0_yaml_path = os.path.join(_REPO_ROOT, "config", "config0.yaml")
+        self._plot_cfg_cache = None
+        self._plot_cfg_mtime = None
+        self._plot_cfg0_cache = None
+        self._plot_cfg0_mtime = None
+
+        # defect_images 目录枚举缓存：(dir_path, mtime) -> set(文件名)
+        self._defect_dir_listing_cache = {}
         # 产线状态刷新（低频）
         self._line_state_timer = QTimer(self)
         self._line_state_timer.timeout.connect(self._refresh_line_state)
@@ -998,12 +1123,13 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self._refresh_fukuan_status_layout()
 
         tip = (
-            "幅宽状态说明（含工程容差，偏宽松）：\n"
-            f"· 允许带：实测低于「设定−max({FUKUAN_NARROW_ABS_MM:.0f}mm, 设定×{FUKUAN_NARROW_REL:.1%})」才算显著偏窄；\n"
-            f"· 报警：记录中曾连续≥{FUKUAN_ALARM_CONSEC}帧显著偏窄；\n"
-            f"· 预警：当前末尾连续≥{FUKUAN_WARN_TAIL_STREAK}帧显著偏窄，且未触发报警；\n"
-            "· 注意：最近一次显著偏窄，但末尾连续未达预警；\n"
-            "· 正常：当前未显著偏窄，且无报警条件。"
+            "幅宽状态说明（对称容差，偏窄/偏宽均计为超出范围）：\n"
+            f"· 允许范围：实测须在 [设定−带宽, 设定+带宽] mm 内，"
+            f"带宽=max({FUKUAN_NARROW_ABS_MM:.0f}mm, 设定×{FUKUAN_NARROW_REL:.1%})；\n"
+            f"· 报警：最近 {FUKUAN_ALARM_WINDOW} 帧全部超出允许范围；\n"
+            f"· 预警：末尾连续≥{FUKUAN_WARN_TAIL_STREAK}帧超出，且未满 {FUKUAN_ALARM_WINDOW} 帧全超；\n"
+            "· 注意：当前帧超出允许范围，但末尾连续未达预警；\n"
+            "· 正常：当前在允许范围内，且未触发报警。"
         )
         for lbl in self._small_fukuan_labels():
             lbl.setToolTip(tip)
@@ -1034,7 +1160,8 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                 f'<span style="color:#7f8c8d;font-size:11px;">'
                 f"<b>等待数据</b><br/>设定 <b>{baseline:.0f}</b> mm</span>"
             )
-        th = fukuan_narrow_threshold_mm(baseline)
+        lo = fukuan_narrow_threshold_mm(baseline)
+        hi = fukuan_wide_threshold_mm(baseline)
         delta = last_mm - baseline
         delta_txt = f"{delta:+.1f}"
         if baseline:
@@ -1056,23 +1183,23 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                 hint += f"，reason={r}"
             hint += "）"
             sub_lines.append(hint)
-        narrow = fukuan_is_significantly_narrow(last_mm, baseline)
+        oor = fukuan_out_of_range_mm(last_mm, baseline)
         if has_alarm:
             tier = "报警"
             tier_color = "#c0392b"
             sub_lines.append(
-                f"历史曾连续≥{FUKUAN_ALARM_CONSEC}帧低于允许下限({th:.0f}mm)"
+                f"最近 {FUKUAN_ALARM_WINDOW} 帧均超出允许范围 [{lo:.0f}, {hi:.0f}] mm"
             )
-        elif tail_streak >= FUKUAN_WARN_TAIL_STREAK and narrow:
+        elif tail_streak >= FUKUAN_WARN_TAIL_STREAK and oor:
             tier = "预警"
             tier_color = "#d35400"
             sub_lines.append(
-                f"末尾已连续 {tail_streak} 帧低于允许下限({th:.0f}mm)"
+                f"末尾已连续 {tail_streak} 帧超出允许范围 [{lo:.0f}, {hi:.0f}] mm"
             )
-        elif narrow:
+        elif oor:
             tier = "注意"
             tier_color = "#b7950b"
-            sub_lines.append(f"实测低于允许下限({th:.0f}mm)")
+            sub_lines.append(f"当前超出允许范围 [{lo:.0f}, {hi:.0f}] mm")
         else:
             tier = "正常"
             tier_color = "#1e8449"
@@ -2443,6 +2570,10 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         try:
             if proc.state() != QProcess.NotRunning:
                 try:
+                    self._silent_disconnect_process_signals(proc)
+                except Exception:
+                    pass
+                try:
                     proc.kill()
                 except Exception:
                     pass
@@ -2546,17 +2677,37 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             pass
 
     def _ensure_csharp_running(self) -> bool:
-        """C# 被手动关闭后，再次点击启动应能召回。"""
-        csharp_exe = os.environ.get(
-            "MULTICAM_DEMO_EXE",
-            os.path.join(_REPO_ROOT, "external", "MultiCamDemo", "MultiCamDemo.exe"),
-        )
-        csharp_workdir = os.environ.get(
-            "MULTICAM_DEMO_CWD",
-            os.path.join(_REPO_ROOT, "external", "MultiCamDemo"),
-        )
-        if not os.path.exists(csharp_exe):
-            QMessageBox.critical(self, "启动失败", f"未找到 C# 程序：\n{csharp_exe}")
+        """启动 / 召回 C# 多相机采集程序。优先环境变量，其次仓库内可执行文件。"""
+        root = _PROJECT_ROOT
+        csharp_exe = os.environ.get("MULTICAM_DEMO_EXE", "").strip() or None
+        csharp_workdir = os.environ.get("MULTICAM_DEMO_CWD", "").strip() or None
+        if csharp_exe and os.path.isfile(csharp_exe):
+            if not csharp_workdir or not os.path.isdir(csharp_workdir):
+                csharp_workdir = os.path.dirname(csharp_exe)
+        else:
+            ext = os.path.join(root, "external", "MultiCamDemo", "MultiCamDemo.exe")
+            if os.path.isfile(ext):
+                csharp_exe = ext
+                csharp_workdir = os.path.join(root, "external", "MultiCamDemo")
+            else:
+                csharp_exe = None
+                csharp_workdir = None
+                for sub in ("Release", "Debug"):
+                    d = os.path.join(root, "DalsaGrabDemoTcp", "MultiCamDemo", "bin", sub)
+                    exe = os.path.join(d, "MultiCamDemo.exe")
+                    if os.path.isfile(exe):
+                        csharp_exe = exe
+                        csharp_workdir = d
+                        break
+        if not csharp_exe or not os.path.isfile(csharp_exe):
+            QMessageBox.critical(
+                self,
+                "启动失败",
+                "未找到 MultiCamDemo.exe。\n\n请任选其一：\n"
+                "1) 设置环境变量 MULTICAM_DEMO_EXE（及可选 MULTICAM_DEMO_CWD）\n"
+                "2) 将程序放到 external/MultiCamDemo/MultiCamDemo.exe\n"
+                "3) 在仓库内编译 DalsaGrabDemoTcp，生成 bin/Release 或 bin/Debug\n",
+            )
             return False
         proc = getattr(self, "csharp_process", None)
         try:
@@ -2640,67 +2791,261 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                 QMessageBox.warning(self, '密码错误', '请输入正确的密码！', QMessageBox.Ok)
 
     def closeEvent(self, event):
-        # 关闭窗口：需要真正停掉接收端与外部进程（不同于“暂停”）
+        # 不使用 button_stop_click + 冗长 wait：主线程会长时间阻塞，表现为关窗卡死、python.exe 无响应。
+        # 退出顺序：先断开子进程信号并 kill 检测端（释放 888x 端口），再快速结束监视线程。
         try:
-            self.button_stop_click()
+            try:
+                self.render_timer.stop()
+            except Exception:
+                pass
+            try:
+                _write_runtime_state(paused=True)
+            except Exception:
+                pass
+            # 先结束检测端/C#：释放监听端口（避免仅靠杀主进程留下子 python 占位 888x）
+            self._kill_child_processes_on_exit()
+            self._force_stop_monitor_threads_for_exit()
+        except Exception as e:
+            print(f"[UI][exit] 关闭清理异常: {e}", flush=True)
         finally:
-            self.terminate_processes()
+            event.accept()
         super().closeEvent(event)
 
-    def button_stop_click(self):
-        # 1. 停止界面上的定时器
-        self.render_timer.stop()
+    def _silent_disconnect_process_signals(self, proc) -> None:
+        if proc is None:
+            return
+        for name in ("readyReadStandardOutput", "readyReadStandardError", "finished", "errorOccurred"):
+            try:
+                getattr(proc, name).disconnect()
+            except Exception:
+                pass
 
-        # 2. 停止所有子线程
-        # (注意：直接 terminate 线程比较暴力，最好是在线程里写一个 stop() 方法来修改标志位，但这里先沿用你的逻辑)
-        for i in range(self._visible_count()):
-            if self.waveform_threads[i] and self.waveform_threads[i].isRunning():
-                self.waveform_threads[i].terminate()
-                self.waveform_threads[i].wait()
-
-        for i in range(self._visible_count()):
-            if self.loader_thread[i] and self.loader_thread[i].isRunning():
-                self.loader_thread[i].terminate()
-                self.loader_thread[i].wait()
-            if self.loader_thread2[i] and self.loader_thread2[i].isRunning():
-                self.loader_thread2[i].terminate()
-                self.loader_thread2[i].wait()
-
-        # 3. 暂停策略：
-        # - 不杀 C# 发送端（它只负责发送）
-        # - 不杀 Python 接收端（保持 socket/连接，避免重连问题）
-        # - 仅通过运行态开关让接收端进入暂停（长度从 history_image_id 继续累加）
+    def _join_stop_monitor_qthread(
+        self,
+        t,
+        *,
+        label="",
+        allow_hard_kill=True,
+        graceful_wait_ms=None,
+    ) -> None:
+        """
+        主线程调用：向工作线程投递 _stop_in_thread，再 wait。
+        allow_hard_kill=False：仅用于「暂停」，禁止 QThread.terminate()（易与 Matplotlib/Qt 状态机冲突导致整进程退出）。
+        """
+        if t is None:
+            return
+        if graceful_wait_ms is None:
+            graceful_wait_ms = 450 if allow_hard_kill else 2800
         try:
+            nm = t.objectName() or type(t).__name__
+        except Exception:
+            nm = "QThread"
+        try:
+            running0 = t.isRunning()
+        except Exception:
+            running0 = False
+        tag = f"{label or nm}"
+        print(f"[UI][stop] → 请求停止线程 {tag} allow_hard_kill={allow_hard_kill} grace_ms={graceful_wait_ms}", flush=True)
+        try:
+            if hasattr(t, "_is_running"):
+                t._is_running = False
+        except Exception:
+            pass
+        if not running0:
+            print(f"[UI][stop]   线程 {tag} 本就未运行", flush=True)
+            return
+        try:
+            QMetaObject.invokeMethod(t, "_stop_in_thread", Qt.QueuedConnection)
+        except Exception as ex:
+            print(f"[UI][stop]   invokeMethod 失败 {tag}: {ex}", flush=True)
+        if not t.wait(int(graceful_wait_ms)):
+            if allow_hard_kill:
+                print(f"[UI][stop]   {tag} 优雅退出超时，使用 terminate()", flush=True)
+                try:
+                    t.terminate()
+                except Exception as ex:
+                    print(f"[UI][stop]   terminate() 异常 {tag}: {ex}", flush=True)
+                t.wait(380)
+            else:
+                print(
+                    f"[UI][stop][warn] {tag} 在 {graceful_wait_ms}ms 内未结束，未使用 terminate（防崩溃）；"
+                    f"仍可继续用界面；若异常请再试一次暂停或关闭软件。",
+                    flush=True,
+                )
+        try:
+            done = not t.isRunning()
+        except Exception:
+            done = True
+        print(f"[UI][stop] ← 线程 {tag} stopped_ok={done}", flush=True)
+
+    def _force_stop_monitor_threads_for_exit(self) -> None:
+        """关窗：停掉全部幅宽/缺陷线程（含未显示条数）。允许 terminate。"""
+        for i in range(self.MAX_STRIPS):
+            self._join_stop_monitor_qthread(
+                self.waveform_threads[i] if i < len(self.waveform_threads) else None,
+                label=f"waveform[{i}]",
+                allow_hard_kill=True,
+                graceful_wait_ms=450,
+            )
+            self._join_stop_monitor_qthread(
+                self.loader_thread[i] if i < len(self.loader_thread) else None,
+                label=f"loader_up[{i}]",
+                allow_hard_kill=True,
+                graceful_wait_ms=450,
+            )
+            self._join_stop_monitor_qthread(
+                self.loader_thread2[i] if i < len(self.loader_thread2) else None,
+                label=f"loader_dn[{i}]",
+                allow_hard_kill=True,
+                graceful_wait_ms=450,
+            )
+            if i < len(self.waveform_threads):
+                self.waveform_threads[i] = None
+            if i < len(self.loader_thread):
+                self.loader_thread[i] = None
+            if i < len(self.loader_thread2):
+                self.loader_thread2[i] = None
+
+    def _kill_child_processes_on_exit(self) -> None:
+        """务必结束 QProcess 子进程，否则检测端 python 会继续占用监听端口。"""
+        # 1) Python 检测端（持有 TCP listen）
+        p = getattr(self, "python_process", None)
+        if p is not None:
+            try:
+                self._silent_disconnect_process_signals(p)
+                if p.state() != QProcess.NotRunning:
+                    print("[UI][exit] 正在结束 Python 接收端子进程…", flush=True)
+                    p.kill()
+                    if not p.waitForFinished(2500):
+                        print("[UI][exit][warn] Python 子进程未在 2.5s 内退出，可能需任务管理器结束残留 python.exe", flush=True)
+            except Exception as e:
+                print(f"[UI][exit] 结束 Python 子进程出错: {e}", flush=True)
+            finally:
+                self.python_process = None
+
+        # 2) C# 发送端
+        cs = getattr(self, "csharp_process", None)
+        if cs is not None:
+            try:
+                self._silent_disconnect_process_signals(cs)
+                if cs.state() != QProcess.NotRunning:
+                    cs.terminate()
+                    if not cs.waitForFinished(1200):
+                        cs.kill()
+                        cs.waitForFinished(600)
+            except Exception as e:
+                print(f"[UI][exit] 结束 C# 子进程出错: {e}", flush=True)
+            finally:
+                self.csharp_process = None
+
+    def _gather_pause_workers(self):
+        """当前可见系统的幅宽线程 + 上下表面缺陷负载线程列表。"""
+        workers = []
+        n = self._visible_count()
+        for i in range(n):
+            t = self.waveform_threads[i] if i < len(self.waveform_threads) else None
+            workers.append((t, f"waveform sys{i+1}"))
+        for i in range(n):
+            lt = self.loader_thread[i] if i < len(self.loader_thread) else None
+            workers.append((lt, f"loader_up sys{i+1}"))
+            lt2 = self.loader_thread2[i] if i < len(self.loader_thread2) else None
+            workers.append((lt2, f"loader_dn sys{i+1}"))
+        return workers
+
+    def _pause_wait_workers_with_pumping(self, workers, deadline_ms=2800):
+        """主线程泵事件，避免「逐线程 wait×3s」把界面卡死；工作线程应在长循环中响应 _is_running。"""
+        app = QApplication.instance()
+        et = QElapsedTimer()
+        et.start()
+        while et.elapsed() < int(deadline_ms):
+            alive = any(t is not None and t.isRunning() for (t, _lab) in workers)
+            if not alive:
+                print("[UI][stop] 所有监视线程已协作退出。", flush=True)
+                return True
+            if app is not None:
+                ms_left = max(1, int(deadline_ms) - int(et.elapsed()))
+                slice_ms = min(48, ms_left)
+                try:
+                    app.processEvents(QEventLoop.AllEvents, slice_ms)
+                except Exception:
+                    try:
+                        app.processEvents()
+                    except Exception:
+                        pass
+            else:
+                time.sleep(0.02)
+        return False
+
+    def button_stop_click(self):
+        """暂停：不杀检测子进程；派发停止后短时泵事件，避免主线程卡顿。"""
+        print("[UI][stop] ========== 点击「暂停/停止检测界面」==========", flush=True)
+        try:
+            try:
+                self.render_timer.stop()
+            except Exception as e:
+                print(f"[UI][stop] render_timer.stop: {e}", flush=True)
+
+            workers = self._gather_pause_workers()
+            for t, tag in workers:
+                if t is None:
+                    continue
+                try:
+                    if hasattr(t, "_is_running"):
+                        t._is_running = False
+                except Exception:
+                    pass
+                try:
+                    if t.isRunning():
+                        QMetaObject.invokeMethod(t, "_stop_in_thread", Qt.QueuedConnection)
+                        print(f"[UI][stop] 已派发 _stop → {tag}", flush=True)
+                except Exception as ex:
+                    print(f"[UI][stop] invokeMethod 失败 {tag}: {ex}", flush=True)
+
             _write_runtime_state(paused=True)
-
-            # 更新界面状态
             self._set_run_state(False)
-            print("已暂停：UI 停止刷新，接收端保活并从历史长度继续计数")
 
-        except Exception as e:
-            print(f"停止进程发生错误：{e}")
+            cooperative = self._pause_wait_workers_with_pumping(workers, deadline_ms=2800)
+
+            still = [(t, lab) for (t, lab) in workers if t is not None and t.isRunning()]
+            if still:
+                if not cooperative:
+                    print(
+                        f"[UI][stop][warn] {len(still)} 个线程未及时退出（可能此前卡在长循环）；将 terminate",
+                        flush=True,
+                    )
+                for t, tag in still:
+                    try:
+                        print(f"[UI][stop] terminate() → {tag}", flush=True)
+                        t.terminate()
+                        t.wait(400)
+                        print(f"[UI][stop] ← {tag} stopped_ok={not t.isRunning()}", flush=True)
+                    except Exception as ex:
+                        print(f"[UI][stop] terminate 异常 {tag}: {ex}", flush=True)
+
+            print(
+                "已暂停：UI 停止刷新，接收端保活并从历史长度继续计数",
+                flush=True,
+            )
+            print("[UI][stop] ========== 暂停流程结束 ==========", flush=True)
+        except Exception:
+            print("[UI][stop][FATAL] button_stop_click 未捕获异常:", flush=True)
+            traceback.print_exc()
 
     def terminate_processes(self):
         """
-        这个函数用于窗口关闭事件 (closeEvent) 中的强制清理
+        兼容旧调用：与关窗时一致，强制结束子进程并释放端口。
         """
+        self._kill_child_processes_on_exit()
+
+
+
+    def _safe_stop_monitor_threads(self):
+        """开始检测前停止幅宽/缺陷读取线程与渲染定时器，避免重复点开始导致信号与线程倍增。"""
         try:
-            # C# 进程清理
-            if self.csharp_process:
-                if self.csharp_process.state() != QProcess.NotRunning:
-                    self.csharp_process.kill()  # 直接强制杀死
-                    self.csharp_process.waitForFinished(500)
-
-            # Python 进程清理
-            if self.python_process:
-                if self.python_process.state() != QProcess.NotRunning:
-                    self.python_process.kill()
-                    self.python_process.waitForFinished(500)
-
-        except Exception as e:
-            print(f"强制清理进程出错: {e}")
-
-
+            self.render_timer.stop()
+        except Exception:
+            pass
+        self._force_stop_monitor_threads_for_exit()
 
     def  button_start_click(self):
         # 继续/启动：
@@ -2726,15 +3071,19 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             else:
                 _write_runtime_state(paused=False)
                 self.start_programs()
-        except Exception:
-            # 启动流程里会有各类弹窗/检查，这里不因控制文件失败中断
-            self.start_programs()
+        except Exception as e:
+            print(f"button_start_click 启动分支异常: {e}")
         # 启动成功后再显示运行
         try:
             running = getattr(self, "python_process", None) is not None and self.python_process.state() != QProcess.NotRunning
         except Exception:
             running = False
         self._set_run_state(bool(running))
+
+        try:
+            self._safe_stop_monitor_threads()
+        except Exception:
+            pass
 
         with open(os.path.join(_REPO_ROOT, 'config', 'config.yaml'), 'r', encoding='utf-8') as file:
             config = yaml.safe_load(file)
@@ -2744,7 +3093,7 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         with open(os.path.join(_REPO_ROOT, 'config', 'config0.yaml'), 'r', encoding='utf-8') as file:
             config0 = yaml.safe_load(file)
 
-            # 为三个检测系统分别创建上下表面的缺陷检测线程
+        # 为各检测系统分别创建上下表面的缺陷检测线程
         self._load_system_count_from_config()
         threads = []
         for i in range(self._visible_count()):
@@ -2772,7 +3121,7 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             self.loader_thread2[system_index - 1] = loader_thread2
             print(f"检测系统{system_index}缺陷检测线程已启动")
             # 然后启动幅宽监测
-        self.render_timer.start(33)
+        self.render_timer.start(80)
         self.showfukuan()
 
     def _layout_status_panel(self) -> None:
@@ -3060,6 +3409,8 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         try:
             system_index = detection_system_index - 1
             self.total_data[system_index] = data
+            if len(data) > TOTAL_DATA_MAX_SAMPLES:
+                self.total_data[system_index] = data[-TOTAL_DATA_MAX_SAMPLES:]
             self.abnormal_status[system_index] = has_abnormal
             self.fukuan_last_measured[system_index] = last_mm
             self.fukuan_tail_narrow[system_index] = tail_streak
@@ -3130,23 +3481,32 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         统一渲染入口：由 QTimer 驱动，处理所有可见系统（2~4条）的渲染逻辑。
         合并了逻辑计算和 Matplotlib 绘图，代码量大，但函数数量最少。
         """
-
-        # 字体路径（假设它不变）
-        font_path = os.path.join(_REPO_ROOT, 'config', 'simhei.ttf')
-        font_prop = fm.FontProperties(fname=font_path)
-
+        full_cfg = {}
         try:
-            with open(
-                os.path.join(_REPO_ROOT, "config", "config.yaml"),
-                "r",
-                encoding="utf-8",
-            ) as f:
-                full_cfg = yaml.safe_load(f) or {}
+            p = getattr(self, "_plot_cfg_yaml_path", os.path.join(_REPO_ROOT, "config", "config.yaml"))
+            mtime = os.path.getmtime(p)
+            if getattr(self, "_plot_cfg_mtime", None) != mtime or getattr(self, "_plot_cfg_cache", None) is None:
+                with open(p, "r", encoding="utf-8") as f:
+                    self._plot_cfg_cache = yaml.safe_load(f) or {}
+                self._plot_cfg_mtime = mtime
+            full_cfg = self._plot_cfg_cache or {}
         except Exception:
             full_cfg = {}
         self._ui_defect_cfg = self._read_ui_defect_display_config(full_cfg)
         ui = self._ui_defect_cfg
         TARGET_X_WINDOW_M = ui["target_window_m"]
+
+        config0 = {}
+        try:
+            p0 = getattr(self, "_plot_cfg0_yaml_path", os.path.join(_REPO_ROOT, "config", "config0.yaml"))
+            m0 = os.path.getmtime(p0)
+            if getattr(self, "_plot_cfg0_mtime", None) != m0 or getattr(self, "_plot_cfg0_cache", None) is None:
+                with open(p0, "r", encoding="utf-8") as f:
+                    self._plot_cfg0_cache = yaml.safe_load(f) or {}
+                self._plot_cfg0_mtime = m0
+            config0 = self._plot_cfg0_cache or {}
+        except Exception:
+            config0 = {}
 
         # 浮点游标平滑参数：每帧至少前进 min_step 个采样点，追赶 gap 时按 alpha 比例 + 上限 max_step
         SMOOTH_MIN_STEP = 0.025
@@ -3159,9 +3519,7 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                 detection_system_index = system_index + 1
                 small_fukuan_labels = self._small_fukuan_labels()
 
-                # --- 1. 配置读取和初始检查 ---
-                with open(os.path.join(_REPO_ROOT, 'config', 'config0.yaml'), 'r', encoding='utf-8') as file:
-                    config0 = yaml.safe_load(file)
+                # --- 1. 配置读取和初始检查（config0 已在帧首按 mtime 缓存）---
                 n = _clamp_strip_count_ui(int(config0.get("strip_count", 3) or 3))
                 truth = _truth_strip_index_1based(detection_system_index, n)
                 baseline_width = config0.get(f"fukuan_{truth}", 0)
@@ -3366,12 +3724,16 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                 self.cm[system_index] = current_multiple
                 self.cm2[system_index] = current_multiple
 
-                # --- 4. 数据插值与 X 轴（连续滑动）---
-                idx_axis = np.arange(total_len, dtype=float)
-                raw_arr = np.asarray(raw_data, dtype=float)
+                # --- 4. 数据插值与 X 轴（连续滑动）：仅对窗口内索引切片，避免 np.arange(total_len) 全量 ---
+                lo = int(max(0, np.floor(start_f)))
+                hi = int(min(total_len - 1, np.ceil(end_f)))
+                if hi < lo:
+                    lo, hi = 0, max(0, total_len - 1)
+                idx_axis = np.arange(lo, hi + 1, dtype=float)
+                raw_arr = np.asarray(raw_data[lo : hi + 1], dtype=float)
                 n_samples = max(64, min(512, int(max(2, (end_f - start_f) * 6)) + 1))
                 xi = np.linspace(start_f, end_f, n_samples)
-                xi = np.clip(xi, 0.0, float(total_len - 1))
+                xi = np.clip(xi, float(lo), float(hi))
                 y_plot = np.interp(xi, idx_axis, raw_arr)
                 x_plot = (xi - start_f) * x_step
                 abs_x_offset = start_f * x_step
@@ -3543,7 +3905,7 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             # 启动/继续前：取消暂停（接收端读取该运行态控制）
             _write_runtime_state(paused=False)
 
-            with open(os.path.join(_REPO_ROOT, 'config', 'config0.yaml'), 'r', encoding='utf-8') as file:
+            with open(os.path.join(_PROJECT_ROOT, "config", "config0.yaml"), "r", encoding="utf-8") as file:
                 config = yaml.safe_load(file)
 
             missing_configs = []
@@ -3583,16 +3945,12 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                 # =========================
                 python_exe = os.environ.get('STEEL_PYTHON_EXE', sys.executable)
 
-                # 若之前启动过且仍在运行：不重启（避免断连/长度重置）
                 if getattr(self, "python_process", None) is not None and self.python_process.state() != QProcess.NotRunning:
                     print("Python 接收端已在运行，跳过重启（将直接继续）")
                 else:
                     self.python_process = QProcess(self)
-                    # 合并 stdout/stderr，避免你只连 stdout 结果报错信息丢了
                     self.python_process.setProcessChannelMode(QProcess.MergedChannels)
-                    # 你原来只连了 StandardOutput，这里仍然走 handle_output 就够了
                     self.python_process.readyReadStandardOutput.connect(self.handle_output)
-                    # 子进程退出/错误诊断（关键：判断是否“启动即崩溃”）
                     try:
                         self.python_process.finished.connect(self._on_python_finished)
                     except Exception:
@@ -3601,32 +3959,33 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                         self.python_process.errorOccurred.connect(self._on_python_error)
                     except Exception:
                         pass
-                    # 设置工作目录（强烈建议：相对路径/读取配置更稳定）
-                    self.python_process.setWorkingDirectory(os.path.join(_REPO_ROOT))
-                    # 启动
+                    self.python_process.setWorkingDirectory(_PROJECT_ROOT)
                     args = ["-u", "-m", "app.online.detect_anomalies_online"]
                     print(f"[UI] 启动检测端: {python_exe} {' '.join(args)}")
                     print(f"[UI] 检测端工作目录: {self.python_process.workingDirectory()}")
                     self.python_process.start(python_exe, args)
                     if not self.python_process.waitForStarted(3000):
-                        QMessageBox.critical(self, "启动失败",
-                                             "Python 检测程序启动失败，请检查解释器路径/脚本路径/环境依赖。")
+                        QMessageBox.critical(
+                            self,
+                            "启动失败",
+                            "Python 检测程序启动失败，请检查解释器路径/脚本路径/环境依赖。",
+                        )
                         return
-                    # 启动后立刻检查“结果根目录是否被创建”
-                    try:
-                        with open(os.path.join(_REPO_ROOT, "config", "config0.yaml"), "r", encoding="utf-8") as _cf:
-                            _c0 = yaml.safe_load(_cf) or {}
-                        _cid = str(_c0.get("conduct_id", "") or "")
-                        _date = datetime.now().strftime("%Y%m%d")
-                        _exp = os.path.join(os.path.join(_REPO_ROOT, "detect result"), _date, _cid)
-                        if not os.path.isdir(_exp):
-                            print(f"[UI][warn] 检测端已启动，但结果根目录尚不存在: {_exp}")
-                            print("  - 若持续不存在：通常是检测端启动即报错退出 / conduct_id 不一致 / 权限问题")
-                    except Exception:
-                        pass
+
+                try:
+                    with open(os.path.join(_PROJECT_ROOT, "config", "config0.yaml"), "r", encoding="utf-8") as _cf:
+                        _c0 = yaml.safe_load(_cf) or {}
+                    _cid = str(_c0.get("conduct_id", "") or "")
+                    _date = datetime.now().strftime("%Y%m%d")
+                    _exp = os.path.join(_PROJECT_ROOT, "detect result", _date, _cid)
+                    if not os.path.isdir(_exp):
+                        print(f"[UI][warn] 检测端已启动，但结果根目录尚不存在: {_exp}")
+                        print("  - 若持续不存在：通常是检测端启动即报错退出 / conduct_id 不一致 / 权限问题")
+                except Exception:
+                    pass
 
                 # =========================
-                # 2) 启动/召回 C# 多相机程序（MultiCamDemo.exe）
+                # 2) 启动/召回 C# 多相机程序（MultiCamDemo.exe，本仓库 DalsaGrabDemoTcp）
                 # =========================
                 if not self._ensure_csharp_running():
                     return
@@ -3640,7 +3999,7 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
 
                 # ---- 关键诊断：UI camid 与检测端输出目录命名必须一致 ----
                 try:
-                    with open(os.path.join(_REPO_ROOT, "config", "config.yaml"), "r", encoding="utf-8") as _f:
+                    with open(os.path.join(_PROJECT_ROOT, "config", "config.yaml"), "r", encoding="utf-8") as _f:
                         _cfg = yaml.safe_load(_f) or {}
                     up_id = int(_cfg.get("camrea_id_up_cls", -1))
                     down_id = int(_cfg.get("camrea_id_down_cls", -1))
@@ -4062,20 +4421,34 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         :param y: y 坐标
         :return: 匹配的文件名，如果未找到返回 None
         """
-        # 遍历目录中的文件
         try:
-            if not os.path.exists(directory):
-                print("目录不存在")
+            if not directory or not os.path.isdir(directory):
                 return None
-
-            files = os.listdir(directory)
-            for file_name in os.listdir(directory):
-                # 检查文件名是否包含 {x}_{y}
-                if f"{x}_{y}" in file_name:
-                    return file_name  # 返回匹配的文件名
-            return None  # 未找到则返回 None
+            try:
+                mtime = os.path.getmtime(directory)
+            except Exception:
+                mtime = 0.0
+            cache = getattr(self, "_defect_dir_listing_cache", None)
+            if cache is None:
+                self._defect_dir_listing_cache = {}
+                cache = self._defect_dir_listing_cache
+            ent = cache.get(directory)
+            if ent is None or ent[0] != mtime:
+                try:
+                    name_set = set(os.listdir(directory))
+                except Exception:
+                    return None
+                cache[directory] = (mtime, name_set)
+            else:
+                name_set = ent[1]
+            needle = f"{int(x)}_{int(y)}"
+            for file_name in name_set:
+                if needle in file_name:
+                    return file_name
+            return None
         except Exception as e:
             print(f"寻找细节图文件名过程中出现未知错误: {str(e)}")
+            return None
 
 
     def display_image_up(self, folder_path, file_name,  system_index):
@@ -4168,7 +4541,6 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             print("图片已设置到 Label")
             # 7. 强制刷新
             label.repaint()
-            QApplication.processEvents()  # 处理挂起的事件
 
         except Exception as e:
             print(f"点击显示系统{system_index + 1}上表面图像错误: {str(e)}")
@@ -4215,7 +4587,6 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             scaled_pixmap = pixmap.scaled(label_width, label_height, Qt.IgnoreAspectRatio)
             label.setPixmap(scaled_pixmap)
             label.repaint()
-            QApplication.processEvents()  # 处理挂起的事件
         except Exception as e:
             print(f"点击显示系统{system_index + 1}下表面图像错误: {str(e)}")
 

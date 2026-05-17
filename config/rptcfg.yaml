@@ -27,6 +27,14 @@ cls_model_by_product:
     - 3
     source: current
     trained_at: '2026-04-02 12:00:00'
+  '4':
+    model_path: cls_model\train-result\20260501_121549\cls_checkpoint.pth
+    remap_modelidx_to_rptid_1based:
+    - 1
+    - 2
+    - 3
+    source: train-result
+    trained_at: '20260501_121549'
 colors:
   擦伤: '#4682B4'
   污渍: '#32CD32'
@@ -118,18 +126,18 @@ print_cls:
 - 1
 - 2
 - 3
-product_cls: '1'
+product_cls: '2'
 product_cls_names:
   '1': 316L
   '2': '301'
   '3': '321'
   '4': '304'
-rptcfg_revision: 304
-rptcfg_updated_at: '2026-05-02 14:13:01'
+rptcfg_revision: 387
+rptcfg_updated_at: '2026-05-18 00:06:23'
 rptcfg_updated_by: DESKTOP-NSH13CD
 steel_length_range: []
 strip_id: '1'
-time: '20260402'
+time: '20260517'
 update_info: false
 updates_down:
 - area_interval: '[0, 20]'

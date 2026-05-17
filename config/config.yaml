@@ -28,7 +28,8 @@ cam1_patchcore_edge_weight_profile: ease_out_cubic
 cam1_patchcore_k: 3.0
 cam1_seg_anomaly_thres: 0.0
 cam1_standard_ratio_x: 0.4308
-cam1_times: 0.858658
+# times：纵向 mm/px = ratio_x×times；按带速 85m/min、实测接收 0.8fps、帧高 4096 推算 ratio_y=(85000/60/0.8)/4096≈0.432333
+cam1_times: 1.003558
 cam1_use_gradient_detection: true
 cam2_bg_ksize: 101
 cam2_blur_ksize: 5
@@ -43,7 +44,7 @@ cam2_patchcore_edge_weight_profile: ease_out_cubic
 cam2_patchcore_k: 3.0
 cam2_seg_anomaly_thres: 0.3
 cam2_standard_ratio_x: 0.4578
-cam2_times: 0.8080166
+cam2_times: 0.944371
 cam2_use_gradient_detection: true
 cam3_bg_ksize: 101
 cam3_blur_ksize: 5
@@ -58,7 +59,7 @@ cam3_patchcore_edge_weight_profile: ease_out_cubic
 cam3_patchcore_k: 3.0
 cam3_seg_anomaly_thres: 0.3
 cam3_standard_ratio_x: 0.4578
-cam3_times: 0.8080166
+cam3_times: 0.944371
 cam3_use_gradient_detection: true
 cam4_bg_ksize: 201
 cam4_blur_ksize: 5
@@ -73,7 +74,7 @@ cam4_patchcore_edge_weight_profile: ease_out_cubic
 cam4_patchcore_k: 3.0
 cam4_seg_anomaly_thres: 0.3
 cam4_standard_ratio_x: 0.4368
-cam4_times: 0.83572
+cam4_times: 0.989774
 cam4_use_gradient_detection: true
 camrea_id_down:
 - '3'

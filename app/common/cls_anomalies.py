@@ -65,7 +65,13 @@ def cls_anomalies(model_path, result_all_path, camrea_id, multi_strip=False):
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # === Step 1. 自动检测多带钢路径 ===
-    cam_dir = os.path.join(result_all_path, str(camrea_id))
+    # camrea_id 可为配置中的数字相机名，或已解析的 上表面/下表面（由 gen_report_cls 传入）
+    _cam_key = str(camrea_id).strip()
+    if _cam_key not in ("上表面", "下表面"):
+        _cam_key = _strip_paths.resolve_roll_cam_subdir(
+            result_all_path, _cam_key, "上表面", "下表面", "2", "3", "1", "4"
+        )
+    cam_dir = os.path.join(result_all_path, _cam_key)
     if not os.path.exists(cam_dir):
         print(f"[警告] 未找到 {cam_dir}，跳过分类。")
         return

@@ -168,3 +168,47 @@ def discover_strip_dir_basenames_under_cam(cam_dir: str) -> List[str]:
             found.append(d)
     found.sort()
     return found
+
+
+def resolve_roll_cam_subdir(result_all_path: str, configured: str, *fallbacks: str) -> str:
+    """
+    在卷根 result_all_path 下，将配置中的相机/表面目录名解析为实际存在的一级子目录 basename。
+    优先使用 configured；不存在时依次尝试 fallbacks（如 上表面/下表面 与旧数字目录）。
+    """
+    roll = str(result_all_path or "").strip()
+    names: List[str] = []
+    c = str(configured or "").strip()
+    if c:
+        names.append(c)
+    for f in fallbacks:
+        fs = str(f).strip()
+        if fs and fs not in names:
+            names.append(fs)
+    for n in names:
+        p = os.path.join(roll, n)
+        if os.path.isdir(p):
+            return n
+    return c or (names[0] if names else "")
+
+
+def pick_strip_scan_root_subdir(result_all_path: str, legacy_cam_up_list: Optional[List[Any]] = None) -> str:
+    """
+    报告生成：在卷根下选择用于枚举条带子目录的一级目录。
+    新数据为 上表面/ 下表面；旧数据为 camrea_id_up 下列出的数字相机目录。
+    """
+    roll = str(result_all_path or "").strip()
+    for name in ("上表面", "下表面"):
+        p = os.path.join(roll, name)
+        if os.path.isdir(p) and discover_strip_dir_basenames_under_cam(p):
+            return name
+    lst = legacy_cam_up_list if isinstance(legacy_cam_up_list, (list, tuple)) else []
+    for item in lst:
+        n = str(item).strip()
+        if not n:
+            continue
+        p = os.path.join(roll, n)
+        if os.path.isdir(p) and discover_strip_dir_basenames_under_cam(p):
+            return n
+    if lst:
+        return str(lst[0]).strip()
+    return "上表面"

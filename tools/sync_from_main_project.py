@@ -273,6 +273,28 @@ def _post_sync_fixups() -> None:
             "args = [\n            _PYTHON_EXE,\n            \"-u\",\n            \"-m\",\n            _GEN_REPORT_MODULE,",
             s,
         )
+        # 修正：report_change 位于 ui/，开发态数据根只能是仓库根（一层 ..），不能 ..,..
+        s = s.replace(
+            "os.path.abspath(os.path.join(here, \"..\", \"..\"))",
+            "os.path.abspath(os.path.join(here, \"..\"))",
+        )
+        # 主工程可能设 _GEN_REPORT_MODULE = _gen_script（磁盘路径），-m 必须是模块名
+        s = re.sub(
+            r"(?m)^_GEN_REPORT_MODULE\s*=\s*_gen_script\s*$",
+            "_GEN_REPORT_MODULE = \"app.report.gen_report_cls\"",
+            s,
+        )
+        # 固定 make_standard 到本仓库 ui/（覆写 F_mainui 路径逻辑）
+        s = re.sub(
+            r"(?ms)^_make_std\s*=\s*os\.path\.join\(_CODE_ROOT,\s*\"F_mainui\".*?^_MAKE_STD_SCRIPT\s*=\s*_make_std\s*$",
+            "_MAKE_STD_SCRIPT = os.path.join(_PROJECT_ROOT, \"ui\", \"make_standard.py\")",
+            s,
+        )
+        s = re.sub(
+            r"(?m)^_PYTHON_EXE\s*=\s*os\.environ\.get\(\"STEEL_PYTHON_EXE\",\s*r?\"[^\"]+\"\)\s*$",
+            "_PYTHON_EXE = os.environ.get(\"STEEL_PYTHON_EXE\", sys.executable)",
+            s,
+        )
         # 修正可能出现的转义残留：\"-m\" -> "-m"
         s = s.replace("\\\"-m\\\"", "\"-m\"")
         _write_text(ui_report_change, s)

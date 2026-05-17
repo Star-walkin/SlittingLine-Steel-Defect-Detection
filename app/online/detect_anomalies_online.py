@@ -29,6 +29,7 @@ import traceback
 from app.common import speed_monitor
 from app.common.speed_monitor import init_monitor, get_monitor, StageTimer
 import shutil
+from typing import Optional
 
 import strip_result_paths as _strip_paths
 
@@ -358,7 +359,12 @@ def writer_loop():
             task = write_queue.get(timeout=FLUSH_INTERVAL)
 
             if task is None:
-                # 外部发来的退出信号
+                # 先 flush 再退出，避免队列里仍有 append_jsonl 等任务未落盘
+                if batch:
+                    try:
+                        _process_batch(batch)
+                    except Exception:
+                        traceback.print_exc()
                 break
 
             batch.append(task)
@@ -826,6 +832,16 @@ def detect(img, new_image_id, cam_id, strip_id, M, F, Checker, info_process, sav
                         pts.append([float(x), float(y)])
                     except Exception:
                         pass
+            ars = []
+            if isinstance(area_list, list):
+                for a in area_list:
+                    try:
+                        ars.append(int(a))
+                    except Exception:
+                        try:
+                            ars.append(int(float(a)))
+                        except Exception:
+                            pass
             write_queue.put({
                 "type": "append_jsonl_line",
                 "fpath": ev_path,
@@ -836,6 +852,7 @@ def detect(img, new_image_id, cam_id, strip_id, M, F, Checker, info_process, sav
                     "cam_id": int(cam_id),
                     "strip_id": int(strip_id),
                     "points": pts,
+                    "areas": ars,
                 },
             })
     except Exception:
@@ -957,6 +974,20 @@ def process_image(image_data, history_image_id_list, index, cam_id,
 
 
 
+def _queue_put_drop_oldest(image_queue, item, cam_id: int) -> None:
+    """队列满时丢弃最旧帧，避免阻塞 recv 与内存堆积（在线优先实时）。"""
+    while True:
+        try:
+            image_queue.put_nowait(item)
+            return
+        except queue.Full:
+            try:
+                image_queue.get_nowait()
+                print(f"[backpressure] CAM{int(cam_id) + 1} queue full, dropped oldest frame", flush=True)
+            except queue.Empty:
+                pass
+
+
 # 接收图像的线程
 def get_host_ip():  # 获得ip
     try:
@@ -967,17 +998,27 @@ def get_host_ip():  # 获得ip
         s.close()
     return ip
 
+def _recv_exact(conn, n: int) -> Optional[bytes]:
+    """从流式 socket 读取恰好 n 字节；对端关闭则返回 None。"""
+    buf = b""
+    while len(buf) < n:
+        chunk = conn.recv(n - len(buf))
+        if not chunk:
+            return None
+        buf += chunk
+    return buf
+
+
+# 与 DalsaGrabDemoTcp/MultiCamDemo Form1.cs 一致：12 字节小端头 = uint32(bodyLen) + uint64(frameSeq)，再接 body。
+_TCP_IMAGE_WIRE_HEADER_BYTES = 12
+_TCP_IMAGE_MAX_BODY_BYTES = 256 * 1024 * 1024  # 256MB 上限，防畸形长度拖垮内存
+
+
 def receive_images(sock, cam_id, image_queue):
     """
-    与 detect_anomalies_new.py 一致：
-    单次阻塞 accept → 单连接内循环收包（4 字节小端长度 + payload），与 new 的协议相同。
-    额外在循环首检查 shutdown_event，并在退出时关闭 conn，便于主程序关闭监听套接字后结束线程。
-    """
-    """
-    说明：
-    - 发送端（C#/simulate）可能会断开/重连；Win 下也常见 10054 reset。
-    - 原实现 accept 一次就退出会导致「上表面/下表面某一路断线后永远不再收图」。
-    - 这里改为：外层循环持续 accept，单连接断开后回到 accept，直到 shutdown_event。
+    单次阻塞 accept → 单连接内循环收包。
+    线协议：12 字节小端 (uint32 payloadLen + uint64 frameSeq) + payload，与 DalsaGrabDemoTcp SendTcpFrame 一致。
+    发送端可能断开/重连；外层循环持续 accept，单连接断开后回到 accept，直到 shutdown_event。
     """
     index = 0
     while not shutdown_event.is_set():
@@ -990,20 +1031,26 @@ def receive_images(sock, cam_id, image_queue):
             print(f"客户端{cam_id + 1}已连接:", address)
 
             while not shutdown_event.is_set():
-                length_bytes = conn.recv(4)
-                if not length_bytes:
+                header = _recv_exact(conn, _TCP_IMAGE_WIRE_HEADER_BYTES)
+                if header is None or len(header) < _TCP_IMAGE_WIRE_HEADER_BYTES:
                     break
-                length = struct.unpack("I", length_bytes)[0]
-
-                image_data = b""
-                while len(image_data) < length:
-                    packet = conn.recv(length - len(image_data))
-                    if not packet:
-                        break
-                    image_data += packet
+                body_len, _wire_seq = struct.unpack("<IQ", header)
+                if body_len <= 0 or body_len > _TCP_IMAGE_MAX_BODY_BYTES:
+                    print(
+                        f"[warn] CAM{int(cam_id) + 1} invalid frame body_len={body_len}, closing connection",
+                        flush=True,
+                    )
+                    break
+                image_data = _recv_exact(conn, body_len)
+                if image_data is None or len(image_data) != body_len:
+                    print(
+                        f"[warn] CAM{int(cam_id) + 1} incomplete frame body: expected {body_len}, got {len(image_data or b'')}",
+                        flush=True,
+                    )
+                    break
 
                 try:
-                    image_queue.put((image_data, index))
+                    _queue_put_drop_oldest(image_queue, (image_data, index), cam_id)
                     # ---- 产线心跳：收到一帧就刷新（只更新内存；落盘由 _heartbeat_writer 周期写）----
                     try:
                         with _hb_lock:
@@ -1405,6 +1452,90 @@ def worker(image_queue, cam_id, history_image_id_list, M, F, Checker, info_proce
 
     print(f"[exit] worker(cam={cam_id}) 已退出")
 
+
+def rebuild_anomaly_lists_from_center_jsonl(strip_folder: str):
+    """
+    从 defect_events_center.jsonl 重建与旧版 image_anomaly_center/area.json 同构的列表。
+    每行对应一帧；无缺陷帧为 points=[]、areas=[]。
+    若文件不存在返回 None（调用方不写盘）；存在则返回 (centers, areas)。
+    """
+    jpath = os.path.join(strip_folder, "defect_events_center.jsonl")
+    if not os.path.isfile(jpath):
+        return None
+    centers = []
+    areas = []
+    with open(jpath, "r", encoding="utf-8") as f:
+        for line in f:
+            s = line.strip()
+            if not s:
+                continue
+            try:
+                ev = json.loads(s)
+            except Exception:
+                continue
+            pts = ev.get("points", [])
+            ars = ev.get("areas", [])
+            if not isinstance(pts, list):
+                pts = []
+            if not isinstance(ars, list):
+                ars = []
+            frame_c = []
+            for p in pts:
+                try:
+                    x, y = p
+                    frame_c.append([float(x), float(y)])
+                except Exception:
+                    continue
+            centers.append(frame_c)
+            frame_a = []
+            for a in ars:
+                try:
+                    frame_a.append(int(a))
+                except Exception:
+                    try:
+                        frame_a.append(int(float(a)))
+                    except Exception:
+                        pass
+            areas.append(frame_a)
+    return centers, areas
+
+
+def flush_legacy_anomaly_json_for_roll_base(base_result_path, active_cam_ids, num_strips, roll_strip_dir_names):
+    """进程退出时：由 defect_events_center.jsonl 重建 image_anomaly_center/area.json。"""
+    for cam_id in active_cam_ids:
+        cam_name = _cam_output_folder_name(cam_id)
+        cam_dir = os.path.join(base_result_path, cam_name)
+        if not os.path.isdir(cam_dir):
+            continue
+        try:
+            info = Anomaly_info_List(filepath=cam_dir)
+        except Exception:
+            continue
+        for sid in range(int(num_strips)):
+            strip_base = (
+                roll_strip_dir_names[sid]
+                if isinstance(roll_strip_dir_names, (list, tuple))
+                and sid < len(roll_strip_dir_names)
+                and str(roll_strip_dir_names[sid])
+                else f"strip_{sid + 1}"
+            )
+            strip_folder = os.path.join(cam_dir, str(strip_base))
+            if not os.path.isdir(strip_folder):
+                continue
+            rebuilt = rebuild_anomaly_lists_from_center_jsonl(strip_folder)
+            if rebuilt is None:
+                continue
+            centers, areas = rebuilt
+            try:
+                rel_c = os.path.join(str(strip_base), "image_anomaly_center.json")
+                rel_a = os.path.join(str(strip_base), "image_anomaly_area.json")
+                info.save_anomaly_info(rel_c, centers)
+                info.save_anomaly_info(rel_a, areas)
+            except Exception as e:
+                print(f"[flush] legacy anomaly json failed cam={cam_id} strip={sid}: {e}")
+    print("[flush] legacy image_anomaly_*.json rebuilt from JSONL (where present).")
+
+
 def run_online(cwd_base_result=None):
     """
     启动函数：负责创建 sockets / threads / writer 等，并在 KeyboardInterrupt 时优雅退出。
@@ -1478,7 +1609,8 @@ def run_online(cwd_base_result=None):
     global cam_locks
     # RLock：detect() 内与 worker 可能对同一相机嵌套加锁，避免死锁
     cam_locks = [threading.RLock() for _ in range(num_cams)]
-    image_queues = [queue.Queue(maxsize=200) for _ in range(num_cams)]  # 给队列一个 maxsize 避免无限制堆积
+    # 单帧约 16MB(4096²)；200 帧/路可达数 GB。小队列 + 丢旧帧保实时、保内存。
+    image_queues = [queue.Queue(maxsize=6) for _ in range(num_cams)]
 
     image_anomaly_center_list = [[[] for _ in range(num_strips)] for _ in range(num_cams)]
     image_anomaly_area_list = [[[] for _ in range(num_strips)] for _ in range(num_cams)]
@@ -1540,14 +1672,33 @@ def run_online(cwd_base_result=None):
             conduct_id, base_result_path, Consecutive_thres_num, cam_id
         )
 
-        # listen socket（与 detect_anomalies_new.py 一致：绑定本机 IP + 端口，无 listen 超时）
-        ip_port = (get_host_ip(), port)
+        # listen socket：必须绑定 0.0.0.0，才能同时接受 127.0.0.1（simulate_cams / MultiCamDemo）
+        # 与本机网卡 IP 的连接。若只绑定 get_host_ip() 返回的某一网卡地址，则 127.0.0.1 上无监听，
+        # 表现为模拟器与 C# 连不上、收不到图。
+        listen_addr = "0.0.0.0"
+        ip_port = (listen_addr, port)
         listen_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        listen_sock.bind(ip_port)
-        listen_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            listen_sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        else:
+            try:
+                listen_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            except OSError:
+                pass
+        try:
+            listen_sock.bind(ip_port)
+        except OSError as e:
+            print(
+                f"[fatal] 相机{cam_id + 1} 无法在 {listen_addr}:{port} 监听: {e}\n"
+                f"  常见原因：端口已被其它进程占用，或曾有多进程误共用同端口。请 netstat -ano | findstr :{port} 后结束多余进程。",
+                flush=True,
+            )
+            raise
         listen_sock.listen(5)
         listen_sockets.append(listen_sock)
-        print(f"[listen] 相机{cam_id + 1} 监听 {ip_port[0]}:{port} 中...")
+        print(
+            f"[listen] 相机{cam_id + 1} 监听 {listen_addr}:{port}（客户端请连 127.0.0.1:{port} 或本机 LAN IP）"
+        )
 
         # start receive thread
         t_recv = threading.Thread(target=receive_images, args=(listen_sock, cam_id, image_queues[cam_id]), daemon=True)
@@ -1622,6 +1773,14 @@ def run_online(cwd_base_result=None):
 
     # 最后等待 writer 真正 flush 完成
     writer_t.join(timeout=5)
+
+    # 停机后报表仍读 image_anomaly_center/area.json：从 JSONL 一次性重建（在线阶段不写整表）
+    try:
+        flush_legacy_anomaly_json_for_roll_base(
+            base_result_path, active_cam_ids, num_strips, roll_strip_dir_names
+        )
+    except Exception as e:
+        print(f"[flush][warn] legacy anomaly json rebuild skipped: {e}")
 
     _speed_mon.stop()
     print("[OK] 所有线程已退出，程序优雅关闭完成。")

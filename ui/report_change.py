@@ -16,6 +16,7 @@ from PyQt5.QtGui import QStandardItemModel, QStandardItem
 from PyQt5.QtCore import QEvent, QTimer
 import json
 from datetime import datetime
+from typing import Optional
 from report import Ui_Report  # 引用生成的 ui_para.py 文件
 from cls_config import ClsConfigWindow
 import ast
@@ -153,10 +154,12 @@ def _apply_matrix_corner_labels(table: QTableWidget, *, tr_text: str = "面积",
         try:
             hh = table.horizontalHeader()
             vh = table.verticalHeader()
-            hh.sectionResized.connect(lambda *_: _sync_any())
-            vh.sectionResized.connect(lambda *_: _sync_any())
-            hh.geometriesChanged.connect(_sync_any)
-            vh.geometriesChanged.connect(_sync_any)
+            if not getattr(table, "_corner_header_signals_bound", False):
+                hh.sectionResized.connect(lambda *_: _sync_any())
+                vh.sectionResized.connect(lambda *_: _sync_any())
+                hh.geometriesChanged.connect(_sync_any)
+                vh.geometriesChanged.connect(_sync_any)
+                setattr(table, "_corner_header_signals_bound", True)
             table.viewport().installEventFilter(table)
         except Exception:
             pass
@@ -164,17 +167,50 @@ def _apply_matrix_corner_labels(table: QTableWidget, *, tr_text: str = "面积",
     except Exception:
         pass
 
-# ── 路径常量（与 main.py 保持一致）──────────────────────────────────────────
-_PYTHON_EXE = os.environ.get('STEEL_PYTHON_EXE', sys.executable)
-_GEN_REPORT_MODULE = "app.report.gen_report_cls"
-_MAKE_STD_SCRIPT   = os.path.join(_REPO_ROOT, "ui", "make_standard.py")
-_DETECT_RESULT_DIR = os.path.join(_REPO_ROOT, "detect result")
-_PROJECT_ROOT = os.path.join(_REPO_ROOT)
+# ── 路径：源码 vs PyInstaller onefile ─────────────────────────────────────
+# 数据根：config/、detect result/、table.json 等与 exe 同目录部署（或设环境变量 STEELDEFECT_ROOT）。
+# 代码根：frozen 时为 _MEIPASS（仅用于可从此处 import 的脚本路径）；
+# 细节优化统计已改为本文件内轻量实现，不再依赖 function_bank/torch。
+def _dev_steeldefect_root() -> str:
+    here = os.path.dirname(os.path.abspath(__file__))
+    return os.path.abspath(os.path.join(here, ".."))
+
+
+def _data_root() -> str:
+    env = os.environ.get("STEELDEFECT_ROOT", "").strip()
+    if env:
+        return os.path.abspath(env)
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return _dev_steeldefect_root()
+
+
+def _code_root() -> str:
+    if getattr(sys, "frozen", False):
+        return getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(sys.executable)))
+    return _dev_steeldefect_root()
+
+
+_PROJECT_ROOT = _data_root()
+_CODE_ROOT = _code_root()
+_DETECT_RESULT_DIR = os.path.join(_PROJECT_ROOT, "detect result")
 _DETAIL_OPT_JSON = os.path.join(_PROJECT_ROOT, "config", "detail_optimization.json")
 _AUTH_CONFIG_PATH = os.path.join(_PROJECT_ROOT, "config", "auth.yaml")
+_RPTCFG_PATH = os.path.join(_PROJECT_ROOT, "config", "rptcfg.yaml")
+_CONFIG_PATH = os.path.join(_PROJECT_ROOT, "config", "config.yaml")
+_RUNTIME_STATE_PATH = os.path.join(_PROJECT_ROOT, "config", "runtime_state.json")
 
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
+# 源码运行：用模块方式启动报告；打包 exe 时仍可把 gen_report_cls 打进 _MEIPASS 后改为脚本路径
+_GEN_REPORT_MODULE = "app.report.gen_report_cls"
+_MAKE_STD_SCRIPT = os.path.join(_PROJECT_ROOT, "ui", "make_standard.py")
+
+if getattr(sys, "frozen", False):
+    _PYTHON_EXE = os.environ.get("STEEL_PYTHON_EXE", "python")
+else:
+    _PYTHON_EXE = os.environ.get("STEEL_PYTHON_EXE", sys.executable)
+
+if _CODE_ROOT not in sys.path:
+    sys.path.insert(0, _CODE_ROOT)
 import strip_result_paths as _strip_paths
 
 
@@ -196,38 +232,148 @@ def _load_json_safe(path, default=None):
         return default if default is not None else []
 
 
-def _make_statistic_for_detail(config: dict, rptcfg: dict):
-    """与 gen_report 一致的 Statistic_anomaly，用于只算面积区间表不计图。"""
-    if _PROJECT_ROOT not in sys.path:
-        sys.path.insert(0, _PROJECT_ROOT)
-    import pandas as pd
-    from function_bank import Statistic_anomaly
+def _resolve_area_table_column_key(area_interval_raw: str, area_table) -> str:
+    """与 function_bank.resolve_area_table_column_key 一致；避免导入 function_bank（会连带加载 torch）。"""
+    raw = (area_interval_raw or "").strip()
+    cols = list(area_table.columns)
+    if raw in cols:
+        return raw
+    compact = raw.strip("[]").replace(",", "-").replace(" ", "")
+    for c in cols:
+        if str(c).replace(" ", "") == compact:
+            return c
+    return raw
 
-    table_path = os.path.join(_PROJECT_ROOT, "table.json")
-    standard_area_tables = pd.read_json(table_path, orient="split")
-    cfg0_path = os.path.join(_PROJECT_ROOT, "config", "config0.yaml")
+
+def _area_val_matches_print_area_filter(area_val: float, area_range) -> bool:
+    """与 function_bank.area_val_matches_print_area_filter 一致（无 torch 依赖）。"""
     try:
-        with open(cfg0_path, "r", encoding="utf-8") as f:
-            cfg0 = yaml.safe_load(f) or {}
+        area_val = float(area_val)
     except Exception:
-        cfg0 = {}
-    fukuan0 = cfg0.get("fukuan_1") or cfg0.get("fukuan_2") or 50
-    try:
-        fukuan0 = float(fukuan0)
-    except Exception:
-        fukuan0 = 50.0
-    return Statistic_anomaly(
-        conduct_id=str(rptcfg.get("id", "")),
-        fukuan=fukuan0,
-        range=config["anomaly_area_cls_range"],
-        result_path=".",
-        start_time="",
-        remove_threshold=config.get("remove_threshold", 0),
+        return False
+    if area_range is None:
+        return True
+    if not isinstance(area_range, (list, tuple)) or len(area_range) == 0:
+        return True
+    first = area_range[0]
+    if isinstance(first, (list, tuple)):
+        for seg in area_range:
+            if not isinstance(seg, (list, tuple)) or len(seg) < 1:
+                continue
+            try:
+                lo = float(seg[0])
+            except Exception:
+                continue
+            hi = seg[1] if len(seg) > 1 else None
+            if hi is None:
+                if area_val >= lo:
+                    return True
+            else:
+                try:
+                    hi = float(hi)
+                except Exception:
+                    continue
+                if lo <= area_val < hi:
+                    return True
+        return False
+    if len(area_range) == 2:
+        try:
+            return float(area_range[0]) <= area_val <= float(area_range[1])
+        except Exception:
+            return True
+    if len(area_range) == 1:
+        try:
+            return area_val >= float(area_range[0])
+        except Exception:
+            return True
+    return True
+
+
+def _filter_classes_detail(A, class_list):
+    """与 gen_report_cls.filter_classes 一致；避免 import gen_report_cls（其顶层会 import function_bank/torch）。"""
+    result = {cls: [] for cls in class_list}
+    A = [item for sublist in A for item in sublist]
+    class_set = set(class_list)
+    for item in A:
+        parts = item.split("_")
+        if len(parts) < 4:
+            continue
+        try:
+            class_value = int(parts[0])
+            if class_value not in class_set and (class_value + 1) in class_set:
+                class_value = class_value + 1
+            if class_value not in class_set:
+                continue
+            x = float(parts[1])
+            y = float(parts[2])
+            area = float(parts[3])
+            result[class_value].append([x, y, area])
+        except Exception:
+            continue
+    return result
+
+
+class _DetailStatisticLite:
+    """
+    仅用于「报告修改 → 细节优化」矩阵：实现 Statistic_anomaly.create_area_table 的等价逻辑。
+    不依赖 function_bank / torch，避免 PyInstaller onefile 下 c10.dll 初始化失败导致矩阵全 0。
+    """
+
+    def __init__(
+        self,
+        *,
+        area_bins,
+        steel_length_range,
+        class_labels,
+        cls_all,
+        area_range,
+    ):
+        self.range = area_bins
+        self.steel_length_range = steel_length_range
+        self.cls_all = cls_all or []
+        self.area_range = area_range
+        self.class_labels = dict(class_labels or {})
+
+    def create_area_table(self, data):
+        import pandas as pd
+
+        max_end = self.range[-1][1]
+        columns = [f"{start}-{end}" for start, end in self.range]
+        columns.append(f"> {max_end}")
+        area_table = pd.DataFrame(
+            0,
+            index=[self.class_labels.get(class_id, class_id) for class_id in data.keys()],
+            columns=columns,
+        )
+        indices_dict = {
+            class_label: {f"{start}-{end}": [] for start, end in self.range}
+            for class_label in self.class_labels.values()
+        }
+        for class_id in data.keys():
+            class_label = self.class_labels.get(class_id, class_id)
+            indices_dict.setdefault(class_label, {f"{start}-{end}": [] for start, end in self.range})
+            indices_dict[class_label].setdefault(f"> {max_end}", [])
+        for class_id, areas in data.items():
+            class_label = self.class_labels.get(class_id, class_id)
+            for idx, area in enumerate(areas):
+                for i, (start, end) in enumerate(self.range):
+                    if start <= area < end:
+                        area_table.loc[class_label, f"{start}-{end}"] += 1
+                        indices_dict[class_label][f"{start}-{end}"].append(idx)
+                        break
+                else:
+                    if area >= max_end:
+                        area_table.loc[class_label, f"> {max_end}"] += 1
+                        indices_dict[class_label][f"> {max_end}"].append(idx)
+        return area_table, indices_dict
+
+
+def _make_statistic_for_detail(config: dict, rptcfg: dict):
+    """细节优化专用统计器：不导入 function_bank，避免打包 exe 因 torch DLL 失败而无法填表。"""
+    return _DetailStatisticLite(
+        area_bins=config["anomaly_area_cls_range"],
         steel_length_range=config.get("steel_length_range") or [],
-        update_info=False,
-        standard_area_tables=standard_area_tables,
-        colors=rptcfg.get("colors", {}),
-        class_labels=rptcfg.get("class_labels", {}),
+        class_labels=rptcfg.get("class_labels", {}) or {},
         cls_all=rptcfg.get("class_list", []),
         area_range=rptcfg.get("area_range", []),
     )
@@ -273,12 +419,13 @@ def _surface_area_table_from_files(
     cam_ids,
     stat,
     print_cls,
+    surface_fallback: Optional[str] = None,
 ):
-    """合并多相机 anomaly_info_result.json，按与 gen_report_cls 相同的扁平化 + filter_classes 再统计。"""
-    if _PROJECT_ROOT not in sys.path:
-        sys.path.insert(0, _PROJECT_ROOT)
-    from gen_report_cls import filter_classes
-    from function_bank import area_val_matches_print_area_filter
+    """合并多相机 anomaly_info_result.json，按与 gen_report_cls 相同的扁平化 + filter_classes 再统计。
+    不从 gen_report_cls / function_bank 导入，避免打包 exe 加载 torch 失败。
+    """
+    if _CODE_ROOT not in sys.path:
+        sys.path.insert(0, _CODE_ROOT)
 
     all_data = []
     for cam_id in _normalize_cam_ids(cam_ids):
@@ -289,10 +436,17 @@ def _surface_area_table_from_files(
         all_data.append(raw)
     # 与 gen_report_cls 一致：先按相机摊平一层，再交给 filter_classes 内再摊一层得到 str 条目
     merged = [item for sublist in all_data for item in sublist]
+    if not merged and surface_fallback:
+        fb = str(surface_fallback).strip()
+        if fb:
+            p = os.path.join(result_root, fb, strip_folder, "anomaly_info_result.json")
+            raw = _load_json_safe(p, [])
+            if isinstance(raw, list) and raw:
+                merged = raw
     if not merged:
         empty = {int(c): [] for c in (stat.cls_all or [])}
         return stat.create_area_table(empty)[0]
-    clean_info = filter_classes(merged, class_list=list(stat.cls_all or []))
+    clean_info = _filter_classes_detail(merged, class_list=list(stat.cls_all or []))
     select_info_area = {int(c): [] for c in (stat.cls_all or [])}
     for cls_raw in print_cls or stat.cls_all:
         try:
@@ -314,8 +468,7 @@ def _surface_area_table_from_files(
             sr = stat.steel_length_range
             if isinstance(sr, (list, tuple)) and len(sr) == 2:
                 len_ok = float(sr[0]) <= y_val <= float(sr[1])
-            area_ok = True
-            area_ok = area_val_matches_print_area_filter(area_val, stat.area_range)
+            area_ok = _area_val_matches_print_area_filter(area_val, stat.area_range)
             if len_ok and area_ok:
                 select_info_area[cls].append(area_val)
     return stat.create_area_table(select_info_area)[0]
@@ -325,9 +478,6 @@ def _apply_sparse_updates_to_df(area_table, updates):
     """把 rptcfg 的 updates_* 套到 DataFrame 上（显示用）。"""
     if area_table is None or not updates:
         return area_table
-    if _PROJECT_ROOT not in sys.path:
-        sys.path.insert(0, _PROJECT_ROOT)
-    from function_bank import resolve_area_table_column_key
 
     out = area_table.copy()
     for up in updates:
@@ -340,7 +490,7 @@ def _apply_sparse_updates_to_df(area_table, updates):
         if lab is None or not str(raw_iv).strip():
             continue
         try:
-            col_key = resolve_area_table_column_key(raw_iv, out)
+            col_key = _resolve_area_table_column_key(raw_iv, out)
             if lab in out.index and col_key in out.columns:
                 out.loc[lab, col_key] = nv
         except Exception:
@@ -349,12 +499,8 @@ def _apply_sparse_updates_to_df(area_table, updates):
 
 
 def _df_to_cell_int(df, row_label: str, ui_header: str) -> int:
-    if _PROJECT_ROOT not in sys.path:
-        sys.path.insert(0, _PROJECT_ROOT)
-    from function_bank import resolve_area_table_column_key
-
     try:
-        col = resolve_area_table_column_key(ui_header, df)
+        col = _resolve_area_table_column_key(ui_header, df)
         v = df.loc[row_label, col]
         return int(v)
     except Exception:
@@ -504,7 +650,7 @@ class ReportWindow(QMainWindow, Ui_Report):
             pass
 
         try:
-            cfg = _rpt_read(os.path.join(_REPO_ROOT, "config", "rptcfg.yaml"))
+            cfg = _rpt_read(_RPTCFG_PATH)
             self._rptcfg_revision_at_load = int(cfg.get("rptcfg_revision", 0) or 0)
             self._refresh_sync_label(cfg)
         except Exception:
@@ -526,7 +672,7 @@ class ReportWindow(QMainWindow, Ui_Report):
 
     def _refresh_sync_label(self, cfg: dict = None):
         if cfg is None:
-            cfg = _rpt_read(os.path.join(_REPO_ROOT, "config", "rptcfg.yaml"))
+            cfg = _rpt_read(_RPTCFG_PATH)
         try:
             rev = int(cfg.get("rptcfg_revision", 0) or 0)
         except Exception:
@@ -539,7 +685,7 @@ class ReportWindow(QMainWindow, Ui_Report):
             pass
 
     def _poll_rptcfg_revision(self):
-        meta = _rpt_read_meta(os.path.join(_REPO_ROOT, "config", "rptcfg.yaml"))
+        meta = _rpt_read_meta(_RPTCFG_PATH)
         if meta.revision <= int(getattr(self, "_rptcfg_revision_at_load", 0) or 0):
             return
         # 外部更新
@@ -566,7 +712,7 @@ class ReportWindow(QMainWindow, Ui_Report):
     def _sync_selection_labels(self):
         """从 rptcfg.yaml 同步当前选择信息到界面，同时预填打印参数输入框。"""
         try:
-            with open(os.path.join(_REPO_ROOT, "config", "rptcfg.yaml"), "r", encoding="utf-8") as f:
+            with open(_RPTCFG_PATH, "r", encoding="utf-8") as f:
                 cfg = yaml.safe_load(f) or {}
         except Exception:
             cfg = {}
@@ -577,7 +723,7 @@ class ReportWindow(QMainWindow, Ui_Report):
 
             # 优先把 strip_id 显示为“带钢卡号”（优先卷根目录 config0_snapshot，其次报告目录）
             try:
-                root = os.path.join(os.path.join(_REPO_ROOT, "detect result"), str(_time), str(_id))
+                root = os.path.join(_DETECT_RESULT_DIR, str(_time), str(_id))
                 strip_n = int(_strip)
                 card = ""
 
@@ -608,6 +754,16 @@ class ReportWindow(QMainWindow, Ui_Report):
             except Exception:
                 pass
 
+            # 隐藏 strip_id 框始终写入「数字条带序号」，供细节优化等逻辑读路径；勿用卡号当索引
+            try:
+                _sn = int(float(str(cfg.get("strip_id", "1")).strip()))
+                _sn = max(1, _sn)
+                if hasattr(self, "strip_id"):
+                    self.strip_id.setText(str(_sn))
+            except Exception:
+                if hasattr(self, "strip_id") and not (self.strip_id.text() or "").strip():
+                    self.strip_id.setText("1")
+
             # show_* 标签（现已隐藏，但保留赋值兼容旧逻辑）
             if hasattr(self, "show_time"):
                 self.show_time.setText(_time)
@@ -635,7 +791,7 @@ class ReportWindow(QMainWindow, Ui_Report):
         self._sync_selection_labels()
         # 同步产品型号下拉框选择（若存在）
         try:
-            with open(os.path.join(_REPO_ROOT, "config", "rptcfg.yaml"), "r", encoding="utf-8") as f:
+            with open(_RPTCFG_PATH, "r", encoding="utf-8") as f:
                 cfg = yaml.safe_load(f) or {}
         except Exception:
             cfg = {}
@@ -660,6 +816,11 @@ class ReportWindow(QMainWindow, Ui_Report):
             pass
         try:
             self.initUI3()
+        except Exception:
+            pass
+        # initUI3 内会刷新细节优化；若表格已存在仍为空，再强制从检测目录填一次（报告中心入口）
+        try:
+            self._refresh_detail_optimization_from_data()
         except Exception:
             pass
 
@@ -867,7 +1028,16 @@ class ReportWindow(QMainWindow, Ui_Report):
             cfg = {}
         date_s = ""
         cid = ""
-        strip_raw = "1"
+        # 条带目录索引必须与 rptcfg 中 strip_id（1 起）一致。
+        # show_strip_id 常为「带钢卡号」展示（如 2339），若误作序号会导致 detect result 路径错误、矩阵全空。
+        strip_raw = str(cfg.get("strip_id", "1")).strip()
+        if hasattr(self, "strip_id") and self.strip_id.text().strip():
+            try:
+                _iv = int(float(self.strip_id.text().strip()))
+                if _iv >= 1:
+                    strip_raw = str(_iv)
+            except Exception:
+                pass
         if hasattr(self, "show_time") and self.show_time.text().strip():
             date_s = self.show_time.text().strip()
         else:
@@ -876,10 +1046,6 @@ class ReportWindow(QMainWindow, Ui_Report):
             cid = self.show_id.text().strip()
         else:
             cid = str(cfg.get("id", "")).strip()
-        if hasattr(self, "show_strip_id") and self.show_strip_id.text().strip():
-            strip_raw = self.show_strip_id.text().strip()
-        else:
-            strip_raw = str(cfg.get("strip_id", "1")).strip()
         try:
             strip_n = str(max(1, int(float(strip_raw))))
         except Exception:
@@ -891,12 +1057,8 @@ class ReportWindow(QMainWindow, Ui_Report):
             return
         try:
             self._detail_opt_watcher = QFileSystemWatcher(self)
-            d = os.path.dirname(_DETAIL_OPT_JSON)
-            if os.path.isdir(d):
-                self._detail_opt_watcher.addPath(d)
             if os.path.isfile(_DETAIL_OPT_JSON):
                 self._detail_opt_watcher.addPath(_DETAIL_OPT_JSON)
-            self._detail_opt_watcher.directoryChanged.connect(self._on_detail_json_fs_changed)
             self._detail_opt_watcher.fileChanged.connect(self._on_detail_json_fs_changed)
         except Exception:
             self._detail_opt_watcher = None
@@ -956,10 +1118,7 @@ class ReportWindow(QMainWindow, Ui_Report):
         if from_json:
             try:
                 if hasattr(self, "lbl_sync_status"):
-                    self.lbl_sync_status.setText(
-                        (self.lbl_sync_status.text() or "")
-                        + "  细节表：已从 detail_optimization.json 同步"
-                    )
+                    self.lbl_sync_status.setText("细节表：已从 detail_optimization.json 同步")
             except Exception:
                 pass
 
@@ -1088,8 +1247,12 @@ class ReportWindow(QMainWindow, Ui_Report):
                 stat = _make_statistic_for_detail(config, rptcfg)
                 up_cams = config.get("camrea_id_up_report", []) or []
                 down_cams = config.get("camrea_id_down_report", []) or []
-                df_up0 = _surface_area_table_from_files(result_root, strip_folder, up_cams, stat, print_cls)
-                df_dn0 = _surface_area_table_from_files(result_root, strip_folder, down_cams, stat, print_cls)
+                df_up0 = _surface_area_table_from_files(
+                    result_root, strip_folder, up_cams, stat, print_cls, surface_fallback="上表面"
+                )
+                df_dn0 = _surface_area_table_from_files(
+                    result_root, strip_folder, down_cams, stat, print_cls, surface_fallback="下表面"
+                )
             except Exception as e:
                 print(f"[细节优化] 统计失败: {e}")
 
@@ -1165,13 +1328,18 @@ class ReportWindow(QMainWindow, Ui_Report):
     def closeEvent(self, event):
         # 关闭窗口时将 update_info 置 False，表示本次报告会话结束；
         # 报告中心下次生成前会重新置 True 并写入当前选择。
+        try:
+            if getattr(self, "_sync_timer", None) is not None:
+                self._sync_timer.stop()
+        except Exception:
+            pass
         self.justsaveone('update_info', False)
         super().closeEvent(event)
 
     def print_report(self):
         # 安全闸：当本次会触发“分类推理”(update_info=False)时，必须保证模型与当前类别兼容
         try:
-            cfg0 = _rpt_read(os.path.join(_REPO_ROOT, "config", "rptcfg.yaml"))
+            cfg0 = _rpt_read(_RPTCFG_PATH)
             update_info = bool(cfg0.get("update_info", False))
         except Exception:
             update_info = True
@@ -1183,7 +1351,7 @@ class ReportWindow(QMainWindow, Ui_Report):
             if not getattr(e, "classes", None):
                 QMessageBox.warning(self, "无法打印", "当前模型缺少 classes.json（类别清单），为避免错位无法进行分类推理。")
                 return
-            rpt_names = _rptcfg_class_names(os.path.join(_REPO_ROOT, "config", "rptcfg.yaml"))
+            rpt_names = _rptcfg_class_names(_RPTCFG_PATH)
             ok, remap, diff = _cls_compat_and_remap(model_classes=list(e.classes or []), rptcfg_classes=list(rpt_names or []))
             if not ok:
                 QMessageBox.warning(
@@ -1197,9 +1365,9 @@ class ReportWindow(QMainWindow, Ui_Report):
                 return
             # 确保 remap 写入 runtime_state，供分类脚本使用
             try:
-                runtime_state_path = os.path.join(_REPO_ROOT, "config", "runtime_state.json")
+                runtime_state_path = _RUNTIME_STATE_PATH
                 try:
-                    with open(os.path.join(_REPO_ROOT, "config", "config.yaml"), "r", encoding="utf-8") as f:
+                    with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
                         cfg = yaml.safe_load(f) or {}
                 except Exception:
                     cfg = {}
@@ -1216,7 +1384,7 @@ class ReportWindow(QMainWindow, Ui_Report):
 
         self.non_blocking_information(self, "报告打印", "报告打印中，请等待。")
         try:
-            with open(os.path.join(_REPO_ROOT, "config", "rptcfg.yaml"), "r", encoding="utf-8") as f:
+            with open(_RPTCFG_PATH, "r", encoding="utf-8") as f:
                 rptcfg = yaml.safe_load(f) or {}
         except Exception:
             rptcfg = {}
@@ -1234,6 +1402,13 @@ class ReportWindow(QMainWindow, Ui_Report):
             strip_n = str(max(1, int(float(strip))))
         except (ValueError, TypeError):
             strip_n = "1"
+        # 回收已结束的打印子进程，避免多次打印堆积僵尸进程
+        try:
+            lst = getattr(self, "_report_subprocs", None) or []
+            alive = [p for p in lst if p.poll() is None]
+            self._report_subprocs = alive
+        except Exception:
+            self._report_subprocs = []
         args = [
             _PYTHON_EXE,
             "-u",
@@ -1248,7 +1423,11 @@ class ReportWindow(QMainWindow, Ui_Report):
             "--update-info",
             "true",
         ]
-        self.python_process = subprocess.Popen(args, cwd=os.path.join(_REPO_ROOT))
+        proc = subprocess.Popen(args, cwd=_PROJECT_ROOT)
+        self.python_process = proc
+        if not hasattr(self, "_report_subprocs"):
+            self._report_subprocs = []
+        self._report_subprocs.append(proc)
 
 
     # 替代 QMessageBox.information 的非阻塞实现
@@ -1258,6 +1437,10 @@ class ReportWindow(QMainWindow, Ui_Report):
         msg_box.setText(message)
         msg_box.setIcon(QMessageBox.Information)
         msg_box.setStandardButtons(QMessageBox.Ok)
+        try:
+            msg_box.setAttribute(Qt.WA_DeleteOnClose, True)
+        except Exception:
+            pass
         msg_box.show()  # 非阻塞显示
         return msg_box  # 返回消息框对象（如果需要进一步操作）
 
@@ -1278,7 +1461,7 @@ class ReportWindow(QMainWindow, Ui_Report):
             self.justsaveone('check_cls', check_cls)
             self.justsaveone('strip_id', strip_id)
 
-            with open(os.path.join(_REPO_ROOT, 'config', 'rptcfg.yaml'), 'r', encoding='utf-8') as f:
+            with open(_RPTCFG_PATH, 'r', encoding='utf-8') as f:
                 config = yaml.safe_load(f)
             self.show_time.setText(str(config['time']))
             self.show_id.setText(str(config['id']))
@@ -1364,9 +1547,9 @@ class ReportWindow(QMainWindow, Ui_Report):
         return []
 
     def initUI3(self):
-        with open(os.path.join(_REPO_ROOT, 'config', 'rptcfg.yaml'), 'r', encoding='utf-8') as f:
+        with open(_RPTCFG_PATH, 'r', encoding='utf-8') as f:
             config = yaml.safe_load(f)
-        with open(os.path.join(_REPO_ROOT, 'config', 'config.yaml'), 'r', encoding='utf-8') as f:
+        with open(_CONFIG_PATH, 'r', encoding='utf-8') as f:
             cfg2 = yaml.safe_load(f)
 
         # ── 打印面积 多选下拉 ────────────────────────────────────────────────
@@ -1408,9 +1591,14 @@ class ReportWindow(QMainWindow, Ui_Report):
         if hasattr(self, 'lineEdit_cls'):
             self.lineEdit_cls.hide()
 
-        # 生成表格
-        self.create_table2()
-        self.create_table3()
+        # 生成表格（二次进入时 itemChanged 已连接，否则会误标 _detail_dirty，
+        # 导致后续 _refresh_detail_optimization_from_data 整段跳过、矩阵永远空白）
+        self._detail_table_programmatic = True
+        try:
+            self.create_table2()
+            self.create_table3()
+        finally:
+            self._detail_table_programmatic = False
 
         try:
             self.change_save.clicked.disconnect()
@@ -1430,7 +1618,7 @@ class ReportWindow(QMainWindow, Ui_Report):
     def create_table2(self):
 
         # 获取行列数
-        with open(os.path.join(_REPO_ROOT, 'config', 'rptcfg.yaml'), 'r', encoding='utf-8') as file:
+        with open(_RPTCFG_PATH, 'r', encoding='utf-8') as file:
             data = yaml.safe_load(file)
 
         class_labels = data.get("class_labels", {}) or {}
@@ -1454,7 +1642,7 @@ class ReportWindow(QMainWindow, Ui_Report):
                     self.row_headers.append(v)
         self.row2 = len(self.row_headers)
 
-        with open(os.path.join(_REPO_ROOT, 'config', 'config.yaml'), 'r', encoding='utf-8') as file:
+        with open(_CONFIG_PATH, 'r', encoding='utf-8') as file:
             config = yaml.safe_load(file)
         anomaly_area_cls_range = config.get('anomaly_area_cls_range', [])
         last_end = anomaly_area_cls_range[-1][1]  # 获取最后一个范围的结束值
@@ -1601,7 +1789,7 @@ class ReportWindow(QMainWindow, Ui_Report):
             pass
 
     def initUI2(self):
-        with open(os.path.join(_REPO_ROOT, 'config', 'rptcfg.yaml'), 'r', encoding='utf-8') as f:
+        with open(_RPTCFG_PATH, 'r', encoding='utf-8') as f:
             config = yaml.safe_load(f)
 
         key = str(config.get('product_cls', ''))
@@ -1735,6 +1923,10 @@ class ReportWindow(QMainWindow, Ui_Report):
         )
 
         # 保留导出按钮但更新说明，提示优先走类别配置
+        try:
+            self.standard_save.clicked.disconnect(self.export_data)
+        except Exception:
+            pass
         self.standard_save.clicked.connect(self.export_data)
         self.standard_save.setText("强制同步")
         self.standard_save.setToolTip(
@@ -1743,7 +1935,7 @@ class ReportWindow(QMainWindow, Ui_Report):
         )
 
     def _refresh_model_registry(self):
-        project_root = os.path.join(_REPO_ROOT)
+        project_root = _PROJECT_ROOT
         config_path = os.path.join(project_root, "config", "config.yaml")
         rptcfg_path = os.path.join(project_root, "config", "rptcfg.yaml")
         try:
@@ -1773,7 +1965,7 @@ class ReportWindow(QMainWindow, Ui_Report):
     def _refresh_current_model_info(self):
         """只显示当前 cls_model_path + 是否具备 classes.json + 与当前标准是否一致。"""
         try:
-            with open(os.path.join(_REPO_ROOT, "config", "config.yaml"), "r", encoding="utf-8") as f:
+            with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
                 cfg = yaml.safe_load(f) or {}
         except Exception:
             cfg = {}
@@ -1801,7 +1993,7 @@ class ReportWindow(QMainWindow, Ui_Report):
                     model_classes.append(str(obj.get(kk, "")).strip())
         except Exception:
             model_classes = []
-        rpt_names = _rptcfg_class_names(os.path.join(_REPO_ROOT, "config", "rptcfg.yaml"))
+        rpt_names = _rptcfg_class_names(_RPTCFG_PATH)
         ok, _remap, _diff = _cls_compat_and_remap(model_classes=model_classes, rptcfg_classes=rpt_names) if model_classes else (False, [], {})
         if ok:
             self.lblModelStatus.setStyleSheet("color:#2e7d32; font-weight:bold;")
@@ -1822,7 +2014,7 @@ class ReportWindow(QMainWindow, Ui_Report):
             self.lblModelStatus.setText("未选择模型。")
             return
 
-        rpt_names = _rptcfg_class_names(os.path.join(_REPO_ROOT, "config", "rptcfg.yaml"))
+        rpt_names = _rptcfg_class_names(_RPTCFG_PATH)
 
         if not getattr(e, "model_path", "") or not os.path.exists(str(e.model_path)):
             self.btnModelEnable.setEnabled(False)
@@ -1888,7 +2080,7 @@ class ReportWindow(QMainWindow, Ui_Report):
             QMessageBox.warning(self, "无法启用", "缺少 classes.json（类别清单），为避免错位不允许启用。")
             return
 
-        rpt_names = _rptcfg_class_names(os.path.join(_REPO_ROOT, "config", "rptcfg.yaml"))
+        rpt_names = _rptcfg_class_names(_RPTCFG_PATH)
         ok, remap, diff = _cls_compat_and_remap(model_classes=list(e.classes or []), rptcfg_classes=list(rpt_names or []))
         if not ok:
             QMessageBox.warning(
@@ -1901,7 +2093,7 @@ class ReportWindow(QMainWindow, Ui_Report):
             )
             return
 
-        cfg_path = os.path.join(_REPO_ROOT, "config", "config.yaml")
+        cfg_path = _CONFIG_PATH
         cfg = {}
         try:
             with open(cfg_path, "r", encoding="utf-8") as f:
@@ -1919,7 +2111,7 @@ class ReportWindow(QMainWindow, Ui_Report):
             return
 
         try:
-            runtime_state_path = os.path.join(_REPO_ROOT, "config", "runtime_state.json")
+            runtime_state_path = _RUNTIME_STATE_PATH
             _write_runtime_remap(
                 runtime_state_path,
                 model_path=str(e.model_path),
@@ -1936,7 +2128,7 @@ class ReportWindow(QMainWindow, Ui_Report):
     def standard_show_click(self):
         product_cls = self.product_cls.text()
         # 获取行列数
-        with open(os.path.join(_REPO_ROOT, 'config', 'rptcfg.yaml'), 'r', encoding='utf-8') as file:
+        with open(_RPTCFG_PATH, 'r', encoding='utf-8') as file:
             data = yaml.safe_load(file)
 
         # 获取 class_labels 的最大 key 值
@@ -1946,7 +2138,7 @@ class ReportWindow(QMainWindow, Ui_Report):
         row_headers = list(class_labels.values())
         self.row = max(map(int, class_labels.keys()), default=0)
 
-        with open(os.path.join(_REPO_ROOT, 'config', 'config.yaml'), 'r', encoding='utf-8') as file:
+        with open(_CONFIG_PATH, 'r', encoding='utf-8') as file:
             config = yaml.safe_load(file)
         anomaly_area_cls_range = config.get('anomaly_area_cls_range', [])
         last_end = anomaly_area_cls_range[-1][1]  # 获取最后一个范围的结束值
@@ -1965,7 +2157,7 @@ class ReportWindow(QMainWindow, Ui_Report):
         self.tableWidget_standard.setVerticalHeaderLabels(row_headers)
 
         # 初始化表格内容
-        with open(os.path.join(_REPO_ROOT, 'config', 'rptcfg.yaml'), 'r', encoding='utf-8') as file:
+        with open(_RPTCFG_PATH, 'r', encoding='utf-8') as file:
             config2 = yaml.safe_load(file)
         data_key = f"data{product_cls}"
         data = config2.get(data_key)
@@ -1989,7 +2181,7 @@ class ReportWindow(QMainWindow, Ui_Report):
 
     def create_table(self):
         # 获取行列数
-        with open(os.path.join(_REPO_ROOT, 'config', 'rptcfg.yaml'), 'r', encoding='utf-8') as file:
+        with open(_RPTCFG_PATH, 'r', encoding='utf-8') as file:
             data = yaml.safe_load(file)
 
         # 获取 class_labels 的最大 key 值
@@ -2000,7 +2192,7 @@ class ReportWindow(QMainWindow, Ui_Report):
         row_headers = list(class_labels.values())
         self.row = max(map(int, class_labels.keys()), default=0)
 
-        with open(os.path.join(_REPO_ROOT, 'config', 'config.yaml'), 'r', encoding='utf-8') as file:
+        with open(_CONFIG_PATH, 'r', encoding='utf-8') as file:
             config = yaml.safe_load(file)
         anomaly_area_cls_range = config.get('anomaly_area_cls_range', [])
         last_end = anomaly_area_cls_range[-1][1]  # 获取最后一个范围的结束值
@@ -2020,7 +2212,7 @@ class ReportWindow(QMainWindow, Ui_Report):
         _apply_matrix_corner_labels(self.tableWidget_standard, tr_text="面积", bl_text="缺陷")
 
         # 初始化表格内容
-        with open(os.path.join(_REPO_ROOT, 'config', 'rptcfg.yaml'), 'r', encoding='utf-8') as file:
+        with open(_RPTCFG_PATH, 'r', encoding='utf-8') as file:
             config2 = yaml.safe_load(file)
         data_key = f"data{product_cls}"
         data = config2.get(data_key)
@@ -2063,7 +2255,7 @@ class ReportWindow(QMainWindow, Ui_Report):
         self.config_data[f"data{product_cls}"] = data
         self.justsaveone('product_cls', self.product_cls.text())
         self.justsaveone(f"data{product_cls}", data)
-        self.python_process = subprocess.Popen([_PYTHON_EXE, "-u", _MAKE_STD_SCRIPT], cwd=os.path.join(_REPO_ROOT))
+        self.python_process = subprocess.Popen([_PYTHON_EXE, "-u", _MAKE_STD_SCRIPT], cwd=_PROJECT_ROOT)
         print(data)
 
     def _open_cls_config(self):
@@ -2089,7 +2281,7 @@ class ReportWindow(QMainWindow, Ui_Report):
     def _on_cls_config_closed(self):
         """类别配置关闭后刷新当前型号展示。"""
         try:
-            with open(os.path.join(_REPO_ROOT, 'config', 'rptcfg.yaml'), 'r', encoding='utf-8') as f:
+            with open(_RPTCFG_PATH, 'r', encoding='utf-8') as f:
                 cfg = yaml.safe_load(f) or {}
             self.product_cls.setText(str(cfg.get('product_cls', '')))
             self.create_table()
@@ -2104,7 +2296,7 @@ class ReportWindow(QMainWindow, Ui_Report):
 
         # 初始化四个输入框
         # 从 YAML 文件加载数据并初始化输入框
-        self.load_class_labels(os.path.join(_REPO_ROOT, "config", "rptcfg.yaml"))
+        self.load_class_labels(_RPTCFG_PATH)
 
 
 
@@ -2314,22 +2506,22 @@ class ReportWindow(QMainWindow, Ui_Report):
     def justsaveone(self, name, data, *, skip_auto_report=False):
         try:
             # 冲突保护：若外部 revision 已变化且本窗口也有未保存编辑，禁止覆盖
-            meta = _rpt_read_meta(os.path.join(_REPO_ROOT, "config", "rptcfg.yaml"))
+            meta = _rpt_read_meta(_RPTCFG_PATH)
             if meta.revision > int(getattr(self, "_rptcfg_revision_at_load", 0) or 0) and getattr(self, "_has_unsaved_edits", False):
                 QMessageBox.warning(self, "冲突", "标准已在其他界面更新，请先刷新后再保存。")
                 return
 
             _rpt_update(
-                os.path.join(_REPO_ROOT, "config", "rptcfg.yaml"),
+                _RPTCFG_PATH,
                 {name: data},
                 updated_by=getattr(self, "_updated_by", None),
             )
-            self._rptcfg_revision_at_load = _rpt_read_meta(os.path.join(_REPO_ROOT, "config", "rptcfg.yaml")).revision
+            self._rptcfg_revision_at_load = _rpt_read_meta(_RPTCFG_PATH).revision
             self._refresh_sync_label()
             # 保存标准后：自动触发重生成本次报告（修改模式）；细节优化「保存」显式跳过
             if not skip_auto_report:
                 try:
-                    cfg = _rpt_read(os.path.join(_REPO_ROOT, "config", "rptcfg.yaml"))
+                    cfg = _rpt_read(_RPTCFG_PATH)
                     trigger = bool(cfg.get("update_info", False)) and (
                         name in ("class_labels", "class_list", "print_cls", "colors")
                         or str(name).startswith("data")
@@ -2346,7 +2538,7 @@ class ReportWindow(QMainWindow, Ui_Report):
             print(f"保存数据时出错: {e}")
 
     def rollback_last_standard_change(self):
-        backups = _rpt_list_backups(os.path.join(_REPO_ROOT, "config", "rptcfg.yaml"), limit=3)
+        backups = _rpt_list_backups(_RPTCFG_PATH, limit=3)
         if not backups:
             QMessageBox.information(self, "无备份", "未找到标准备份文件，无法回滚。")
             return
@@ -2363,11 +2555,11 @@ class ReportWindow(QMainWindow, Ui_Report):
             return
         try:
             _rpt_rollback(
-                os.path.join(_REPO_ROOT, "config", "rptcfg.yaml"),
+                _RPTCFG_PATH,
                 target,
                 updated_by=getattr(self, "_updated_by", None),
             )
-            self._rptcfg_revision_at_load = _rpt_read_meta(os.path.join(_REPO_ROOT, "config", "rptcfg.yaml")).revision
+            self._rptcfg_revision_at_load = _rpt_read_meta(_RPTCFG_PATH).revision
             self._has_unsaved_edits = False
             self.initUI2()
             self.initUI3()

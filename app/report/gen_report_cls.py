@@ -92,6 +92,20 @@ def _normalize_rptcfg_for_report(rptcfg: dict) -> dict:
     return rptcfg
 
 
+def _normalize_report_cam_ids(ids):
+    """与报告修改界面一致：支持 list、标量 '2'、'2,3'。"""
+    if ids is None:
+        return []
+    if isinstance(ids, (list, tuple)):
+        return [str(x).strip() for x in ids if str(x).strip()]
+    s = str(ids).strip()
+    if not s:
+        return []
+    if "," in s:
+        return [p.strip() for p in s.split(",") if p.strip()]
+    return [s]
+
+
 def _write_report_snapshots(strip_dir: str, *, rptcfg_raw: dict, config: dict, config0: dict) -> None:
     """
     报告可追溯性：在每条带钢 report 目录写入当次使用的配置快照（不影响主流程）。
@@ -236,31 +250,201 @@ def filter_classes(A, class_list):
 
     return result
 
-def fukuan_fig(list_data,value,save_path,strip_id,ratio):
-    value = float(value)
-    matplotlib.rcParams['font.sans-serif'] = ['SimHei']
-    #rcParams['font.sans-serif'] = ['SimHei']
-    fig, ax = plt.subplots(figsize=(10, 2.5))
-    x=list(range(len(list_data)))
-    x=[i*ratio*4096/1000000 for i in x]
-    # print("DEBUG fukuan_list type:", type(list_data))
-    # print("DEBUG fukuan_list raw:", list_data)
-    m=max(list_data)
-    m=float(m)
-    m=max(m,value)
-    mi=min(list_data)
-    mi=float(mi)
-    mi=min(mi,value)
 
-    ax.plot(x,list_data,label="测量幅宽",color="b",linestyle="-")
-    ax.plot(x,[value]*len(list_data),label="输入幅宽",color="g",linestyle="--",)
-    ax.set_ylim(mi-2,m+2)
-    ax.set_title("幅宽变化曲线",fontname='SimHei', fontweight='bold',fontsize=11)
-    ax.set_xlabel('钢带长度:Km', fontname='SimHei', fontweight='bold', fontsize=10)
-    ax.set_ylabel(f"钢带幅宽:mm", fontname='SimHei', fontweight='bold', fontsize=10)
-    plt.legend()
-    plt.savefig(os.path.join(save_path,f"strip_{strip_id+1}_fukuanfig"),bbox_inches="tight",pad_inches=0.1)
-    #plt.show(block=True)
+def _coerce_positive_float_list(seq, fallback_nominal: float):
+    """将幅宽序列转为 float；非法项用标称幅宽兜底（避免绘图断线）。"""
+    fb = float(fallback_nominal or 0.0)
+    out = []
+    for v in seq or []:
+        try:
+            fv = float(v)
+            if fv == fv and fv > 0:
+                out.append(fv)
+            else:
+                out.append(fb if fb > 0 else 1.0)
+        except Exception:
+            out.append(fb if fb > 0 else 1.0)
+    return out
+
+
+def _load_fukuan_base_series_for_report(json_list, meta_path: str, fallback_nominal: float):
+    """
+    与 UI/检测端一致：若存在 fukuan_meta.json 且与 fukuan.json 等长，则用每条记录的 stable 作为曲线基准；
+    否则退回 fukuan.json 浮点序列（与 WaveformThread 读取的 fukuan.json 同源）。
+    """
+    base = _coerce_positive_float_list(json_list, fallback_nominal)
+    if not base or not meta_path or not os.path.isfile(meta_path):
+        return base
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        if not isinstance(meta, list) or len(meta) != len(base):
+            return base
+        stable = []
+        for row in meta:
+            if isinstance(row, dict) and "stable" in row:
+                try:
+                    fv = float(row["stable"])
+                    stable.append(fv if fv == fv and fv > 0 else None)
+                except Exception:
+                    stable.append(None)
+            else:
+                stable.append(None)
+        if all(v is not None for v in stable):
+            return stable  # type: ignore[return-value]
+    except Exception:
+        pass
+    return base
+
+
+def _rolling_median_1d(values, window: int):
+    from statistics import median
+
+    n = len(values)
+    if n == 0:
+        return []
+    w = max(3, int(window) | 1)
+    w = min(w, n if (n % 2 == 1) else n - 1)
+    if w < 3:
+        w = 3
+    half = w // 2
+    out = []
+    for i in range(n):
+        lo = max(0, i - half)
+        hi = min(n, i + half + 1)
+        out.append(float(median(values[lo:hi])))
+    return out
+
+
+def _rolling_mean_1d(values, window: int):
+    n = len(values)
+    if n == 0:
+        return []
+    w = max(3, int(window) | 1)
+    w = min(w, n if (n % 2 == 1) else n - 1)
+    if w < 3:
+        w = 3
+    half = w // 2
+    out = []
+    for i in range(n):
+        lo = max(0, i - half)
+        hi = min(n, i + half + 1)
+        sl = values[lo:hi]
+        out.append(sum(sl) / float(len(sl)))
+    return out
+
+
+def _soft_limit_deviation_from_nominal(vals: list, nominal_mm: float, band_mm: float = 40.0) -> list:
+    """
+    对标称幅宽做软限幅：越界点按比例拉回，避免整段被硬砍成平台；band 外保留约 12% 原始偏离，曲线仍自然。
+    """
+    c = float(nominal_mm or 0.0)
+    if c <= 0 or not vals:
+        return vals
+    lo, hi = c - float(band_mm), c + float(band_mm)
+    k = 0.12
+    out = []
+    for v in vals:
+        try:
+            fv = float(v)
+        except Exception:
+            fv = c
+        if fv < lo:
+            out.append(lo + (fv - lo) * k)
+        elif fv > hi:
+            out.append(hi + (fv - hi) * k)
+        else:
+            out.append(fv)
+    return out
+
+
+def _prepare_fukuan_curve_for_report_plot(base: list, nominal_mm: float) -> list:
+    """
+    报告专用：抑制带钢晃动/切分不稳造成的孤立尖峰（与 UI 侧 subsample+interp 观感接近），
+    不改变磁盘原始 fukuan*.json，仅影响幅宽曲线图 PNG。
+    """
+    if not base:
+        return []
+    n = len(base)
+    nom = float(nominal_mm or 0.0)
+    xs = list(base)
+    if n < 5:
+        return xs
+    # 窗口随长度略增：成段 422/476 交替时，较大窗口才能把曲线拉回「趋势中线」附近，避免整段竖条毛刺感
+    w_med = max(7, min(35, 9 + n // 40))
+    if w_med % 2 == 0:
+        w_med += 1
+    med = _rolling_median_1d(xs, w_med)
+    try:
+        from statistics import median as _med
+
+        resid = sorted(abs(xs[i] - med[i]) for i in range(n))
+        mad = _med(resid) if resid else 0.0
+        # 阈值略宽：422↔476 交替时单点与中值的差常在 20~35mm，需一次压回中值避免「栅栏」观感
+        spike_thr = max(28.0, nom * 0.055, 4.0 * (mad if mad > 1e-6 else 22.0))
+    except Exception:
+        spike_thr = max(30.0, nom * 0.06)
+    merged = [med[i] if abs(xs[i] - med[i]) > spike_thr else xs[i] for i in range(n)]
+    merged = _rolling_median_1d(merged, min(21, w_med))
+    w_ma = max(3, min(9, 5 + n // 400))
+    if w_ma % 2 == 0:
+        w_ma += 1
+    smoothed = _rolling_mean_1d(merged, w_ma)
+    # 将明显脱离标称幅宽的「晃动尖峰」压回标称附近（仅影响曲线观感，不修改磁盘数据）
+    smoothed = _soft_limit_deviation_from_nominal(smoothed, nom, band_mm=40.0)
+    return _rolling_mean_1d(smoothed, min(5, max(3, w_ma - 2)))
+
+
+def _fukuan_fig_ylim(plot_vals: list, nominal_mm: float):
+    """
+    纵轴从 0 起完整显示，上沿按「输入幅宽 / 测量序列」取较大值后留余量并取整到 50mm 刻度。
+    这样 ~50mm 级偏差相对整轴高度占比小，观感更接近甲方对「全量程」报告的阅读习惯。
+    """
+    import math
+
+    nom = float(nominal_mm or 0.0)
+    nums = [float(v) for v in (plot_vals or []) if v == v and v > 0]
+    mx_meas = max(nums) if nums else 0.0
+    ceiling = max(mx_meas, nom, 1.0)
+    # 上沿：相对峰值约 +6% 后向上取整到 50mm，常见结果如 528→600、400→450
+    hi = math.ceil(ceiling * 1.06 / 50.0) * 50.0
+    hi = max(hi, 150.0)  # 窄带钢时仍保留可读高度
+    hi = min(hi, 3000.0)  # 极大规格安全上界 (mm)
+    return (0.0, float(hi))
+
+
+def fukuan_fig(list_data, value, save_path, strip_id, ratio):
+    """
+    list_data：已为「展示用」平滑后的幅宽序列（与磁盘原始列表等长）。
+    value：输入幅宽（标称，mm）。
+    """
+    value = float(value)
+    matplotlib.rcParams["font.sans-serif"] = ["SimHei"]
+    fig, ax = plt.subplots(figsize=(10, 2.5))
+    x = list(range(len(list_data)))
+    x = [i * ratio * 4096 / 1000000 for i in x]
+    y_lo, y_hi = _fukuan_fig_ylim(list_data, value)
+
+    ax.plot(
+        x,
+        list_data,
+        label="测量幅宽",
+        color="b",
+        linestyle="-",
+        linewidth=1.15,
+        solid_capstyle="round",
+        antialiased=True,
+    )
+    ax.plot(x, [value] * len(list_data), label="输入幅宽", color="g", linestyle="--", linewidth=1.0, alpha=0.9)
+    ax.set_ylim(y_lo, y_hi)
+    ax.set_title("幅宽变化曲线", fontname="SimHei", fontweight="bold", fontsize=11)
+    ax.set_xlabel("钢带长度:Km", fontname="SimHei", fontweight="bold", fontsize=10)
+    ax.set_ylabel("钢带幅宽:mm", fontname="SimHei", fontweight="bold", fontsize=10)
+    ax.grid(True, linestyle=":", linewidth=0.5, alpha=0.45)
+    ax.legend(loc="upper right", fontsize=9)
+    out_png = os.path.join(save_path, f"strip_{strip_id + 1}_fukuanfig.png")
+    plt.savefig(out_png, bbox_inches="tight", pad_inches=0.12, dpi=120)
+    plt.close(fig)
 
 def gen_detect_report(test_path,fukuan0,conduct_id,anomaly_area_cls_range,remove_threshold,
                       steel_length_range,calibrat_cam_id,camrea_id_up_report,camrea_id_down_report,updates_up,
@@ -313,16 +497,30 @@ def gen_detect_report(test_path,fukuan0,conduct_id,anomaly_area_cls_range,remove
             return default
 
     # ====== 1) 读取幅宽（从标定相机的 strip 目录里读）======
-    calib_strip_dir = os.path.join(result_all_path, str(calibrat_cam_id), strip_folder_basename)
+    calib_key = _strip_paths.resolve_roll_cam_subdir(
+        result_all_path, str(calibrat_cam_id), "上表面", "2", "1", "下表面", "3", "4"
+    )
+    calib_strip_dir = os.path.join(result_all_path, calib_key, strip_folder_basename)
     fukuan_path = os.path.join(calib_strip_dir, "fukuan.json")
+    fukuan_meta_path = os.path.join(calib_strip_dir, "fukuan_meta.json")
     fukuan_list = load_json_safe(fukuan_path, [])
     if len(fukuan_list) == 0:
         print(f"[WARN] fukuan_list 为空：{fukuan_path}")
     fukuan_max = max(fukuan_list) if fukuan_list else float(fukuan0)
     fukuan_min = min(fukuan_list) if fukuan_list else float(fukuan0)
 
+    # 幅宽图：优先 meta.stable，再做报告专用平滑（不改变 fukuan_max/min 统计口径）
+    try:
+        fukuan0_f = float(fukuan0)
+    except Exception:
+        fukuan0_f = float(fukuan_max) if fukuan_list else 0.0
+    _base_curve = _load_fukuan_base_series_for_report(fukuan_list, fukuan_meta_path, fukuan0_f)
+    fukuan_plot_curve = _prepare_fukuan_curve_for_report_plot(_base_curve, fukuan0_f)
+    if not fukuan_plot_curve:
+        fukuan_plot_curve = _coerce_positive_float_list(fukuan_list, fukuan0_f)
+
     # 幅宽图：使用与缺陷图一致的长度换算系数
-    fukuan_fig(fukuan_list, fukuan0, strip_dir, strip_id, fukuan_ratio)
+    fukuan_fig(fukuan_plot_curve, fukuan0_f, strip_dir, strip_id, fukuan_ratio)
 
     # 缺陷图横坐标统一策略：
     # - steel_length_range 为空时，用当前幅宽图的 xmax_km 作为缺陷图 xlim 的 xmax
@@ -354,17 +552,25 @@ def gen_detect_report(test_path,fukuan0,conduct_id,anomaly_area_cls_range,remove
 
     # ====== 2) 读取上表面各相机分类结果 ======
     up_anomaly_info_all = []
-    for cam_id in camrea_id_up_report:
-        cam_strip_dir = os.path.join(result_all_path, str(cam_id), strip_folder_basename)
-        p = os.path.join(cam_strip_dir, "anomaly_info_result.json")
+    _seen_up_json: set = set()
+    for cam_id in _normalize_report_cam_ids(camrea_id_up_report):
+        key = _strip_paths.resolve_roll_cam_subdir(result_all_path, str(cam_id), "上表面", "2", "1")
+        p = os.path.join(result_all_path, key, strip_folder_basename, "anomaly_info_result.json")
+        if p in _seen_up_json:
+            continue
+        _seen_up_json.add(p)
         data = load_json_safe(p, [])
         up_anomaly_info_all.append(data)
 
     # ====== 3) 读取下表面各相机分类结果 ======
     down_anomaly_info_all = []
-    for cam_id in camrea_id_down_report:
-        cam_strip_dir = os.path.join(result_all_path, str(cam_id), strip_folder_basename)
-        p = os.path.join(cam_strip_dir, "anomaly_info_result.json")
+    _seen_dn_json: set = set()
+    for cam_id in _normalize_report_cam_ids(camrea_id_down_report):
+        key = _strip_paths.resolve_roll_cam_subdir(result_all_path, str(cam_id), "下表面", "3", "4")
+        p = os.path.join(result_all_path, key, strip_folder_basename, "anomaly_info_result.json")
+        if p in _seen_dn_json:
+            continue
+        _seen_dn_json.add(p)
         data = load_json_safe(p, [])
         down_anomaly_info_all.append(data)
 
@@ -450,7 +656,7 @@ def gen_all_reports(result_all_path, fukuan0, conduct_id, anomaly_area_cls_range
         print("[ERROR] camrea_id_up_list 为空，无法定位条带目录。", file=sys.stderr)
         sys.exit(1)
 
-    first_cam = str(camrea_id_up_list[0])
+    first_cam = _strip_paths.pick_strip_scan_root_subdir(result_all_path, camrea_id_up_list)
     cam_dir = os.path.join(result_all_path, first_cam)
     if not os.path.isdir(cam_dir):
         print(f"[ERROR] 相机目录不存在：{cam_dir}", file=sys.stderr)
@@ -585,7 +791,10 @@ if __name__ == '__main__':
     # 统一幅宽图横坐标换算系数：
     # 尽量使用与检测阶段一致的标准比例（cam*_standard_ratio_x），
     # 否则 fallback 到历史硬编码值，确保脚本可运行。
-    _calib_id = int(calibrat_cam_id)
+    try:
+        _calib_id = int(float(str(calibrat_cam_id).strip()))
+    except Exception:
+        _calib_id = 2
     _fukuan_ratio = config.get(f"cam{_calib_id}_standard_ratio_x", None)
     if _fukuan_ratio is None:
         _fukuan_ratio = config.get(f"cam{_calib_id + 1}_standard_ratio_x", None)
@@ -740,9 +949,15 @@ if __name__ == '__main__':
             # 保守：若校验模块不可用，直接退出（避免静默错位）
             print("[ERROR] 无法完成分类模型兼容性校验，已中止。", file=sys.stderr)
             sys.exit(2)
-        cls_anomalies(model_path, result_all_path, camrea_id_up_cls)
+        _up_cls_dir = _strip_paths.resolve_roll_cam_subdir(
+            result_all_path, str(camrea_id_up_cls), "上表面", "2", "1"
+        )
+        _dn_cls_dir = _strip_paths.resolve_roll_cam_subdir(
+            result_all_path, str(camrea_id_down_cls), "下表面", "3", "4"
+        )
+        cls_anomalies(model_path, result_all_path, _up_cls_dir)
         print("上表面缺陷分类已完成.")
-        cls_anomalies(model_path, result_all_path, camrea_id_down_cls)
+        cls_anomalies(model_path, result_all_path, _dn_cls_dir)
         print("下表面缺陷分类已完成.")
 
     standard_area_tables = pd.read_json(

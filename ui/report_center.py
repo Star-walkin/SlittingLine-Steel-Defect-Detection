@@ -69,6 +69,31 @@ def _first_existing(paths: List[str]) -> Optional[str]:
     return None
 
 
+def _pick_cam_dir_for_strip_discovery(roll: str, legacy_first_cam: Optional[str]) -> Optional[str]:
+    """
+    在卷根下选择用于 discover_strip_dir_basenames_under_cam 的一级目录名。
+    新数据为 上表面/下表面；旧数据可能为 config 中的数字相机目录。
+    """
+    roll = str(roll or "").strip()
+    if not roll or not os.path.isdir(roll):
+        return None
+    for name in ("上表面", "下表面"):
+        cam_dir = os.path.join(roll, name)
+        if not os.path.isdir(cam_dir):
+            continue
+        bases = _strip_paths.discover_strip_dir_basenames_under_cam(cam_dir)
+        if bases:
+            return name
+    leg = str(legacy_first_cam or "").strip()
+    if leg:
+        cam_dir = os.path.join(roll, leg)
+        if os.path.isdir(cam_dir):
+            bases = _strip_paths.discover_strip_dir_basenames_under_cam(cam_dir)
+            if bases:
+                return leg
+    return None
+
+
 def _open_path(path: str) -> None:
     # Windows: use os.startfile
     os.startfile(path)  # type: ignore[attr-defined]
@@ -282,8 +307,9 @@ class ReportCenterWindow(QtWidgets.QMainWindow):
         if isinstance(names, list) and len(names) == int(n) and all(str(x).strip() for x in names):
             return [(i + 1, str(names[i])) for i in range(int(n))]
 
-        if first_cam:
-            cam_dir = os.path.join(roll, first_cam)
+        picked = _pick_cam_dir_for_strip_discovery(roll, first_cam)
+        if picked:
+            cam_dir = os.path.join(roll, picked)
             bases = _strip_paths.discover_strip_dir_basenames_under_cam(cam_dir)
             if bases:
                 return [(i + 1, str(bases[i])) for i in range(len(bases))]
